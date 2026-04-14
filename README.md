@@ -50,6 +50,27 @@ Install Netdata on each monitored host:
 bash <(curl -Ss https://my-netdata.io/kickstart.sh)
 ```
 
+On Offline hosts:
+```bash
+wget -O /tmp/netdata-kickstart.sh https://get.netdata.cloud/kickstart.sh
+sh /tmp/netdata-kickstart.sh --release-channel stable --prepare-offline-install-source ./netdata-offline
+```
+Then transfer with scp (or equivalent)
+
+More info:
+https://learn.netdata.cloud/docs/netdata-agent/installation/linux/offline-systems
+
+Note: 
+Offline systems my install outside of your path. i.e.
+/opt/netdata/bin/netdata 
+/opt/netdata/etc/netdata/netdata.conf
+
+find with: 
+```bash
+whereis
+```
+If necessary.
+
 Verify it is running:
 
 ```bash
