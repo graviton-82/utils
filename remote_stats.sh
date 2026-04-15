@@ -84,6 +84,49 @@ status_from_thresholds() {
     }'
 }
 
+##### Basil Functions #####
+
+get_uptime() {
+    ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" 'bash -s' <<'EOF' 2>/dev/null
+read -r uptime_seconds _ < /proc/uptime || exit 1
+
+awk -v s="$uptime_seconds" 'BEGIN {
+  s = int(s)
+  d = int(s / 86400)
+  h = int((s % 86400) / 3600)
+  m = int((s % 3600) / 60)
+
+  if (d > 0) {
+    printf "%dd%dh\n", d, h
+  } else if (h > 0) {
+    printf "%dh%dm\n", h, m
+  } else {
+    printf "%dm\n", m
+  }
+}'
+EOF
+}
+
+
+status_from_inode_usage() {
+    local value="$1"
+
+    awk -v v="$value" 'BEGIN {
+        if (v >= 90) print "CRITICAL";
+        else if (v >= 80) print "WARNING";
+        else print "OK";
+    }'
+}
+
+get_inodes() {
+    ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" 'bash -s' <<EOF 2>/dev/null
+df -Pi "$disk_mount" | awk 'NR==2 {
+  gsub(/%/, "", \$5)
+  printf "%s|%s\n", \$5, \$6
+}'
+EOF
+}
+
 get_cpu() {
     ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" 'bash -s' <<'EOF' 2>/dev/null
 curl -fsS "http://localhost:19999/api/v1/data?chart=system.cpu" | jq -r '
@@ -236,6 +279,55 @@ EOF
 }
 
 
+##### VPN Profile Functions ######
+
+get_vpn() {
+    ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" 'bash -s' <<'EOF' 2>/dev/null
+WG_IF="wg0"
+
+if ! command -v wg >/dev/null 2>&1; then
+    echo "UNKNOWN|wg_missing"
+    exit 0
+fi
+
+if ! ip link show "$WG_IF" >/dev/null 2>&1; then
+    echo "DOWN|interface_missing"
+    exit 0
+fi
+
+peer_count=$(wg show "$WG_IF" peers 2>/dev/null | awk 'NF {count++} END {print count+0}')
+recent_count=$(wg show "$WG_IF" latest-handshakes 2>/dev/null | awk '
+BEGIN {
+    now = systime()
+    recent = 0
+}
+NF >= 2 {
+    if ($2 > 0 && (now - $2) <= 180) recent++
+}
+END {
+    print recent+0
+}')
+
+echo "${peer_count}|${recent_count}|${WG_IF}"
+EOF
+}
+
+
+status_from_vpn() {
+    local peers="$1"
+    local recent="$2"
+
+    if [[ "$peers" -eq 0 ]]; then
+        echo "WARNING"
+    elif [[ "$recent" -eq 0 ]]; then
+        echo "CRITICAL"
+    elif [[ "$recent" -lt "$peers" ]]; then
+        echo "WARNING"
+    else
+        echo "OK"
+    fi
+}
+
 
 
 ##### Main Script Logic and Formatting #####
@@ -249,6 +341,8 @@ if [[ "$mode" == "--once" ]]; then
     ram_line=$(get_ram || true)
     load_line=$(get_load || true)
     disk_line=$(get_disk || true)
+    uptime_line=$(get_uptime || true)
+    inode_line=$(get_inodes || true)
 
     if [[ -z "$cpu_line" && -z "$ram_line" && -z "$load_line" && -z "$disk_line" ]]; then
         echo "=== ${remote_host} (${remote_target}) ==="
@@ -351,9 +445,34 @@ if [[ "$mode" == "--once" ]]; then
 		fi
 	fi
 
+	if [[ "$profile" == "vpn" ]]; then
+      		vpn_line=$(get_vpn || true)
+
+        if [[ -z "$vpn_line" ]]; then
+            echo "VPN  : UNKNOWN  unavailable"
+        
+    	elif [[ "$vpn_line" == UNKNOWN\|* ]]; then
+            vpn_reason="${vpn_line#UNKNOWN|}"
+            printf "VPN  : %-8s %s\n" "UNKNOWN" "$vpn_reason"
+        
+    	elif [[ "$vpn_line" == DOWN\|* ]]; then
+            vpn_reason="${vpn_line#DOWN|}"
+            vpn_status_colored=$(color_status "CRITICAL")
+            printf "VPN  : %-8b %s\n" "$vpn_status_colored" "$vpn_reason"
+        
+    	else
+            IFS='|' read -r vpn_peers vpn_recent vpn_if <<< "$vpn_line"
+            vpn_status=$(status_from_vpn "$vpn_peers" "$vpn_recent")
+            vpn_status_colored=$(color_status "$vpn_status")
+
+            printf "VPN  : %-8b iface=%s peers=%s recent=%s\n" \
+                "$vpn_status_colored" "$vpn_if" "$vpn_peers" "$vpn_recent"
+        fi
+    fi
+
     exit 0
 fi
 
 ##### Script Execution #####
 
-watch -n 2 -- "$0 $remote_target --once \"$disk_mount\" --profile \"$profile\""
+watch -n 2 -t -- "$0 $remote_target --once \"$disk_mount\" --profile \"$profile\""
