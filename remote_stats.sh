@@ -164,6 +164,25 @@ status_from_pg_connections() {
     }'
 }
 
+status_from_pg_metrics() {
+    local used_pct="$1"
+    local idle_tx="$2"
+    local long_q="$3"
+    local blocked="$4"
+
+    if (( blocked > 0 )); then
+        echo "CRITICAL"
+    elif (( used_pct >= 90 )); then
+        echo "CRITICAL"
+    elif (( idle_tx > 0 || long_q > 0 )); then
+        echo "WARNING"
+    elif (( used_pct >= 80 )); then
+        echo "WARNING"
+    else
+        echo "OK"
+    fi
+}
+
 get_postgres() {
     ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" 'bash -s' <<'EOF' 2>/dev/null
 PGDATABASE=postgres
@@ -191,8 +210,28 @@ psql -X -A -t -q \
     -p "$PGPORT" \
     -U "$PGUSER" \
     -d "$PGDATABASE" \
-    -c "SELECT count(*)::text || '|' || current_setting('max_connections')::text FROM pg_stat_activity;" \
-    2>/dev/null || echo "UNKNOWN|query_failed"
+    -c "
+SELECT
+  'UP'
+  || '|total='   || count(*)
+  || '|max='     || current_setting('max_connections')
+  || '|active='  || count(*) FILTER (WHERE state = 'active')
+  || '|idle='    || count(*) FILTER (WHERE state = 'idle')
+  || '|idle_tx=' || count(*) FILTER (
+       WHERE state = 'idle in transaction'
+         AND xact_start IS NOT NULL
+         AND now() - xact_start > interval '60 seconds'
+     )
+  || '|long_q='  || count(*) FILTER (
+       WHERE state = 'active'
+         AND query_start IS NOT NULL
+         AND now() - query_start > interval '60 seconds'
+     )
+  || '|blocked=' || count(*) FILTER (
+       WHERE wait_event_type = 'Lock'
+     )
+FROM pg_stat_activity;
+" 2>/dev/null || echo "UNKNOWN|query_failed"
 EOF
 }
 
@@ -266,30 +305,51 @@ if [[ "$mode" == "--once" ]]; then
     
     fi
 
-    if [[ "$profile" == "db" ]]; then
-        pg_line=$(get_postgres || true)
+	if [[ "$profile" == "db" ]]; then
+		pg_line=$(get_postgres || true)
 
-        if [[ -z "$pg_line" ]]; then
-            echo "PG   : UNKNOWN  unavailable"
-        elif [[ "$pg_line" == "DOWN" ]]; then
-            pg_status_colored=$(color_status "CRITICAL")
-            printf "PG   : %-8b down\n" "$pg_status_colored"
-        elif [[ "$pg_line" == UNKNOWN\|* ]]; then
-            pg_reason="${pg_line#UNKNOWN|}"
-            printf "PG   : %-8s %s\n" "UNKNOWN" "$pg_reason"
-        else
-            IFS='|' read -r pg_conns pg_max <<< "$pg_line"
-            pg_used_pct=$(awk -v c="$pg_conns" -v m="$pg_max" 'BEGIN {
-                if (m > 0) printf "%.0f", (c/m)*100;
-                else print 0
-            }')
-            pg_status=$(status_from_pg_connections "$pg_used_pct")
-            pg_status_colored=$(color_status "$pg_status")
+		if [[ -z "$pg_line" ]]; then
+			echo "PG   : UNKNOWN  unavailable"
+		elif [[ "$pg_line" == "DOWN" ]]; then
+			pg_status_colored=$(color_status "CRITICAL")
+			printf "PG   : %-8b down\n" "$pg_status_colored"
+		elif [[ "$pg_line" == UNKNOWN\|* ]]; then
+			pg_reason="${pg_line#UNKNOWN|}"
+			printf "PG   : %-8s %s\n" "UNKNOWN" "$pg_reason"
+		elif [[ "$pg_line" == UP\|* ]]; then
+			IFS='|' read -r pg_state \
+				pg_total_field \
+				pg_max_field \
+				pg_active_field \
+				pg_idle_field \
+				pg_idle_tx_field \
+				pg_long_q_field \
+				pg_blocked_field <<< "$pg_line"
 
-            printf "PG   : %-8b conns=%s/%s used=%s%%\n" \
-                "$pg_status_colored" "$pg_conns" "$pg_max" "$pg_used_pct"
-        fi
-    fi
+			pg_total="${pg_total_field#total=}"
+			pg_max="${pg_max_field#max=}"
+			pg_active="${pg_active_field#active=}"
+			pg_idle="${pg_idle_field#idle=}"
+			pg_idle_tx="${pg_idle_tx_field#idle_tx=}"
+			pg_long_q="${pg_long_q_field#long_q=}"
+			pg_blocked="${pg_blocked_field#blocked=}"
+
+			pg_used_pct=$(awk -v c="$pg_total" -v m="$pg_max" 'BEGIN {
+				if (m > 0) printf "%.0f", (c/m)*100;
+				else print 0
+			}')
+
+			pg_status=$(status_from_pg_metrics "$pg_used_pct" "$pg_idle_tx" "$pg_long_q" "$pg_blocked")
+			pg_status_colored=$(color_status "$pg_status")
+
+			printf "PG   : %-8b conns=%s/%s used=%s%% active=%s idle=%s idle_tx=%s long_q=%s blocked=%s\n" \
+				"$pg_status_colored" \
+				"$pg_total" "$pg_max" "$pg_used_pct" \
+				"$pg_active" "$pg_idle" "$pg_idle_tx" "$pg_long_q" "$pg_blocked"
+		else
+			printf "PG   : %-8s %s\n" "UNKNOWN" "unexpected_output"
+		fi
+	fi
 
     exit 0
 fi
@@ -297,4 +357,3 @@ fi
 ##### Script Execution #####
 
 watch -n 2 -- "$0 $remote_target --once \"$disk_mount\" --profile \"$profile\""
-
