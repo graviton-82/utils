@@ -2,20 +2,47 @@
 
 set -u
 
-if [ $# -lt 1 ]; then
-    echo "Usage: $0 user@ip-address [--once] [mount]"
-    exit 1
-fi
-
 remote_target="$1"
 mode="${2:-}"
 disk_mount="${3:-/}"
 
+profile="base"
 
 RED="\033[0;31m"
 YELLOW="\033[0;33m"
 GREEN="\033[0;32m"
 RESET="\033[0m"
+
+remote_target=""
+mode=""
+disk_mount="/"
+profile="base"
+
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 user@ip-address [--once] [mount] [--profile db]"
+    exit 1
+fi
+
+remote_target="$1"
+shift
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --once)
+            mode="--once"
+            ;;
+        --profile)
+            shift
+            profile="${1:-base}"
+            ;;
+        *)
+            disk_mount="$1"
+            ;;
+    esac
+    shift
+done
+
+
 
 color_status() {
     local status="$1"
@@ -124,6 +151,39 @@ EOF
 }
 
 
+
+##### Database Profile Functions ######
+
+get_postgres() {
+    ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" 'bash -s' <<'EOF' 2>/dev/null
+if command -v pg_isready >/dev/null 2>&1; then
+    if ! pg_isready -q; then
+        echo "DOWN"
+        exit 0
+    fi
+else
+    echo "UNKNOWN|pg_isready_missing"
+    exit 0
+fi
+
+if ! command -v psql >/dev/null 2>&1; then
+    echo "UNKNOWN|psql_missing"
+    exit 0
+fi
+
+psql -Atqc "
+SELECT
+    count(*)::text || '|' ||
+    current_setting('max_connections')::text
+FROM pg_stat_activity;
+" 2>/dev/null
+EOF
+}
+
+
+
+##### Main Script Logic and Formatting #####
+
 if [[ "$mode" == "--once" ]]; then
     if ! remote_host=$(ssh -o ConnectTimeout=3 "$remote_target" 'hostname' 2>/dev/null); then
         remote_host="$remote_target"
@@ -186,9 +246,37 @@ if [[ "$mode" == "--once" ]]; then
             "$disk_status_colored" "$disk_used_pct" "$disk_mount_out"
     else
         echo "DISK : UNKNOWN  unavailable"
+    
+    fi
+        if [[ "$profile" == "db" ]]; then
+        pg_line=$(get_postgres || true)
+
+        if [[ -z "$pg_line" ]]; then
+            echo "PG   : UNKNOWN  unavailable"
+        elif [[ "$pg_line" == "DOWN" ]]; then
+            pg_status_colored=$(color_status "CRITICAL")
+            printf "PG   : %-8b down\n" "$pg_status_colored"
+        elif [[ "$pg_line" == UNKNOWN\|* ]]; then
+            pg_status_colored=$(color_status "UNKNOWN")
+            pg_reason="${pg_line#UNKNOWN|}"
+            printf "PG   : %-8b %s\n" "$pg_status_colored" "$pg_reason"
+        else
+            IFS='|' read -r pg_conns pg_max <<< "$pg_line"
+            pg_used_pct=$(awk -v c="$pg_conns" -v m="$pg_max" 'BEGIN {
+                if (m > 0) printf "%.0f", (c/m)*100
+                else print 0
+            }')
+            pg_status=$(status_from_pg_connections "$pg_used_pct")
+            pg_status_colored=$(color_status "$pg_status")
+
+            printf "PG   : %-8b conns=%s/%s used=%s%%\n" \
+                "$pg_status_colored" "$pg_conns" "$pg_max" "$pg_used_pct"
+        fi
     fi
 
     exit 0
 fi
+
+##### Script Execution #####
 
 watch -n 2 -- "$0 $remote_target --once \"$disk_mount\""
