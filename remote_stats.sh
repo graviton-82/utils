@@ -2,10 +2,6 @@
 
 set -u
 
-remote_target="$1"
-mode="${2:-}"
-disk_mount="${3:-/}"
-
 profile="base"
 
 RED="\033[0;31m"
@@ -352,15 +348,21 @@ if [[ "$mode" == "--once" ]]; then
         exit 0
     fi
 
-    echo "=== ${remote_host} (${remote_target}) ==="
+    #echo "=== ${remote_host} (${remote_target}) ==="
+    
+    if [[ -n "$uptime_line" ]]; then
+	echo "=== ${remote_host} (${remote_target}) | UP ${uptime_line} ==="
+    else
+    	echo "=== ${remote_host} (${remote_target}) ==="
+    fi
 
     if [[ -n "$cpu_line" ]]; then
         IFS='|' read -r cpu_user cpu_system cpu_iowait cpu_total <<< "$cpu_line"
         cpu_status=$(status_from_thresholds "$cpu_total" 20 70)
 
 	cpu_status_colored=$(color_status "$cpu_status")
-	printf "CPU  : %-8b user=%.1f%% system=%.1f%% iowait=%.1f%% total=%.1f%%\n" \
-            "$cpu_status_colored" "$cpu_user" "$cpu_system" "$cpu_iowait" "$cpu_total"
+	printf "CPU  : %-9b user=%.1f%% system=%.1f%% iowait=%.1f%% total=%.1f%%\n" \
+    	    "$cpu_status_colored" "$cpu_user" "$cpu_system" "$cpu_iowait" "$cpu_total"
     else
         echo "CPU  : UNKNOWN  unavailable"
     fi
@@ -372,8 +374,10 @@ if [[ "$mode" == "--once" ]]; then
 
 	ram_status_colored=$(color_status "$ram_status")
 
-        printf "RAM  : %-8s used=%.0f%% total=%s GiB\n" \
+
+	printf "RAM  : %-9b used=%.0f%% total=%s GiB\n" \
             "$ram_status_colored" "$ram_used_pct" "$ram_total_gib"
+
     else
         echo "RAM  : UNKNOWN  unavailable"
     fi
@@ -381,8 +385,10 @@ if [[ "$mode" == "--once" ]]; then
     if [[ -n "$load_line" ]]; then
         IFS='|' read -r load1 cpus load_norm <<< "$load_line"
         load_status=$(status_from_thresholds "$load_norm" 70 100)
+
+
 	load_status_colored=$(color_status "$load_status")
-        printf "LOAD : %-8s load1=%s cpus=%s normalized=%s%%\n" \
+	printf "LOAD : %-9b load1=%s cpus=%s normalized=%s%%\n" \
             "$load_status_colored" "$load1" "$cpus" "$load_norm"
     else
         echo "LOAD : UNKNOWN  unavailable"
@@ -392,11 +398,23 @@ if [[ "$mode" == "--once" ]]; then
         IFS='|' read -r disk_used_pct disk_mount_out disk_size_k disk_used_k disk_avail_k <<< "$disk_line"
         disk_status=$(status_from_thresholds "$disk_used_pct" 80 90)
 	disk_status_colored=$(color_status "$disk_status")
-        printf "DISK : %-8s used=%s%% mount=%s\n" \
+
+	printf "DISK : %-9b used=%s%% mount=%s\n" \
             "$disk_status_colored" "$disk_used_pct" "$disk_mount_out"
     else
         echo "DISK : UNKNOWN  unavailable"
     
+    fi
+
+        if [[ -n "$inode_line" ]]; then
+        IFS='|' read -r inode_used_pct inode_mount_out <<< "$inode_line"
+        inode_status=$(status_from_inode_usage "$inode_used_pct")
+        inode_status_colored=$(color_status "$inode_status")
+
+	printf "INOD : %-9b used=%s%% mount=%s\n" \
+            "$inode_status_colored" "$inode_used_pct" "$inode_mount_out"
+    else
+        echo "INOD : UNKNOWN  unavailable"
     fi
 
 	if [[ "$profile" == "db" ]]; then
@@ -406,10 +424,10 @@ if [[ "$mode" == "--once" ]]; then
 			echo "PG   : UNKNOWN  unavailable"
 		elif [[ "$pg_line" == "DOWN" ]]; then
 			pg_status_colored=$(color_status "CRITICAL")
-			printf "PG   : %-8b down\n" "$pg_status_colored"
+			printf "PG   : %-9b down\n" "$pg_status_colored"
 		elif [[ "$pg_line" == UNKNOWN\|* ]]; then
 			pg_reason="${pg_line#UNKNOWN|}"
-			printf "PG   : %-8s %s\n" "UNKNOWN" "$pg_reason"
+			printf "PG   : %-9s %s\n" "UNKNOWN" "$pg_reason"
 		elif [[ "$pg_line" == UP\|* ]]; then
 			IFS='|' read -r pg_state \
 				pg_total_field \
@@ -436,12 +454,12 @@ if [[ "$mode" == "--once" ]]; then
 			pg_status=$(status_from_pg_metrics "$pg_used_pct" "$pg_idle_tx" "$pg_long_q" "$pg_blocked")
 			pg_status_colored=$(color_status "$pg_status")
 
-			printf "PG   : %-8b conns=%s/%s used=%s%% active=%s idle=%s idle_tx=%s long_q=%s blocked=%s\n" \
+			printf "PG   : %-9b conns=%s/%s used=%s%% active=%s idle=%s idle_tx=%s long_q=%s blocked=%s\n" \
 				"$pg_status_colored" \
 				"$pg_total" "$pg_max" "$pg_used_pct" \
 				"$pg_active" "$pg_idle" "$pg_idle_tx" "$pg_long_q" "$pg_blocked"
 		else
-			printf "PG   : %-8s %s\n" "UNKNOWN" "unexpected_output"
+			printf "PG   : %-9s %s\n" "UNKNOWN" "unexpected_output"
 		fi
 	fi
 
@@ -453,19 +471,19 @@ if [[ "$mode" == "--once" ]]; then
         
     	elif [[ "$vpn_line" == UNKNOWN\|* ]]; then
             vpn_reason="${vpn_line#UNKNOWN|}"
-            printf "VPN  : %-8s %s\n" "UNKNOWN" "$vpn_reason"
+            printf "VPN  : %-9s %s\n" "UNKNOWN" "$vpn_reason"
         
     	elif [[ "$vpn_line" == DOWN\|* ]]; then
             vpn_reason="${vpn_line#DOWN|}"
             vpn_status_colored=$(color_status "CRITICAL")
-            printf "VPN  : %-8b %s\n" "$vpn_status_colored" "$vpn_reason"
+            printf "VPN  : %-9b %s\n" "$vpn_status_colored" "$vpn_reason"
         
     	else
             IFS='|' read -r vpn_peers vpn_recent vpn_if <<< "$vpn_line"
             vpn_status=$(status_from_vpn "$vpn_peers" "$vpn_recent")
             vpn_status_colored=$(color_status "$vpn_status")
 
-            printf "VPN  : %-8b iface=%s peers=%s recent=%s\n" \
+            printf "VPN  : %-9b iface=%s peers=%s recent=%s\n" \
                 "$vpn_status_colored" "$vpn_if" "$vpn_peers" "$vpn_recent"
         fi
     fi
@@ -475,4 +493,13 @@ fi
 
 ##### Script Execution #####
 
-watch -n 2 -t -- "$0 $remote_target --once \"$disk_mount\" --profile \"$profile\""
+if [[ "$mode" != "--once" ]]; then
+    watch -n 2 -t -- "$0 $remote_target --once \"$disk_mount\" --profile \"$profile\""
+fi
+
+#The below was causing the script to flash slowly
+#while true; do
+#    clear
+#    "$0" "$remote_target" --once "$disk_mount" --profile "$profile"
+#    sleep 2
+#done
