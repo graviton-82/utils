@@ -154,14 +154,24 @@ EOF
 
 ##### Database Profile Functions ######
 
+status_from_pg_connections() {
+    local value="$1"
+
+    awk -v v="$value" 'BEGIN {
+        if (v >= 90) print "CRITICAL";
+        else if (v >= 70) print "WARNING";
+        else print "OK";
+    }'
+}
+
 get_postgres() {
     ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" 'bash -s' <<'EOF' 2>/dev/null
-if command -v pg_isready >/dev/null 2>&1; then
-    if ! pg_isready -q; then
-        echo "DOWN"
-        exit 0
-    fi
-else
+PGDATABASE=postgres
+PGUSER=remote_monitor
+PGHOST=localhost
+PGPORT=5432
+
+if ! command -v pg_isready >/dev/null 2>&1; then
     echo "UNKNOWN|pg_isready_missing"
     exit 0
 fi
@@ -171,14 +181,21 @@ if ! command -v psql >/dev/null 2>&1; then
     exit 0
 fi
 
-psql -Atqc "
-SELECT
-    count(*)::text || '|' ||
-    current_setting('max_connections')::text
-FROM pg_stat_activity;
-" 2>/dev/null
+if ! pg_isready -q -h "$PGHOST" -p "$PGPORT" -d "$PGDATABASE" -U "$PGUSER"; then
+    echo "DOWN"
+    exit 0
+fi
+
+psql -X -A -t -q \
+    -h "$PGHOST" \
+    -p "$PGPORT" \
+    -U "$PGUSER" \
+    -d "$PGDATABASE" \
+    -c "SELECT count(*)::text || '|' || current_setting('max_connections')::text FROM pg_stat_activity;" \
+    2>/dev/null || echo "UNKNOWN|query_failed"
 EOF
 }
+
 
 
 
@@ -248,7 +265,8 @@ if [[ "$mode" == "--once" ]]; then
         echo "DISK : UNKNOWN  unavailable"
     
     fi
-        if [[ "$profile" == "db" ]]; then
+
+    if [[ "$profile" == "db" ]]; then
         pg_line=$(get_postgres || true)
 
         if [[ -z "$pg_line" ]]; then
@@ -257,13 +275,12 @@ if [[ "$mode" == "--once" ]]; then
             pg_status_colored=$(color_status "CRITICAL")
             printf "PG   : %-8b down\n" "$pg_status_colored"
         elif [[ "$pg_line" == UNKNOWN\|* ]]; then
-            pg_status_colored=$(color_status "UNKNOWN")
             pg_reason="${pg_line#UNKNOWN|}"
-            printf "PG   : %-8b %s\n" "$pg_status_colored" "$pg_reason"
+            printf "PG   : %-8s %s\n" "UNKNOWN" "$pg_reason"
         else
             IFS='|' read -r pg_conns pg_max <<< "$pg_line"
             pg_used_pct=$(awk -v c="$pg_conns" -v m="$pg_max" 'BEGIN {
-                if (m > 0) printf "%.0f", (c/m)*100
+                if (m > 0) printf "%.0f", (c/m)*100;
                 else print 0
             }')
             pg_status=$(status_from_pg_connections "$pg_used_pct")
@@ -279,4 +296,5 @@ fi
 
 ##### Script Execution #####
 
-watch -n 2 -- "$0 $remote_target --once \"$disk_mount\""
+watch -n 2 -- "$0 $remote_target --once \"$disk_mount\" --profile \"$profile\""
+
