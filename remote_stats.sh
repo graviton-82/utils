@@ -2,8 +2,6 @@
 
 set -u
 
-profile="base"
-
 RED="\033[0;31m"
 YELLOW="\033[0;33m"
 GREEN="\033[0;32m"
@@ -15,7 +13,7 @@ disk_mount="/"
 profile="base"
 
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 user@ip-address [--once] [mount] [--profile db]"
+    echo "Usage: $0 <ssh-target|localhost> [--once] [mount] [--profile base|db|vpn]"
     exit 1
 fi
 
@@ -38,7 +36,38 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+##### Localhost + Remote Helpers #####
 
+is_local_target() {
+    local target="$1"
+    local local_host
+
+    local_host="$(hostname)"
+
+    [[ "$target" == "localhost" || \
+       "$target" == "127.0.0.1" || \
+       "$target" == "$local_host" ]]
+}
+
+run_remote() {
+    local cmd="$1"
+
+    if is_local_target "$remote_target"; then
+        bash -lc "$cmd" 2>/dev/null
+    else
+        ssh -n -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" "$cmd"
+    fi
+}
+
+run_remote_bash() {
+    if is_local_target "$remote_target"; then
+        bash -s
+    else
+        ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" 'bash -s'
+    fi
+}
+
+##### Formatting / Status Helpers #####
 
 color_status() {
     local status="$1"
@@ -56,16 +85,13 @@ color_status() {
         OFFLINE)
             printf "${RED}%s${RESET}" "$status"
             ;;
+        UNKNOWN)
+            printf "${YELLOW}%s${RESET}" "$status"
+            ;;
         *)
             printf "%s" "$status"
             ;;
     esac
-}
-
-run_remote() {
-    local cmd="$1"
-    ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" \
-        "bash -lc '$cmd'" 2>/dev/null
 }
 
 status_from_thresholds() {
@@ -80,30 +106,6 @@ status_from_thresholds() {
     }'
 }
 
-##### Basil Functions #####
-
-get_uptime() {
-    ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" 'bash -s' <<'EOF' 2>/dev/null
-read -r uptime_seconds _ < /proc/uptime || exit 1
-
-awk -v s="$uptime_seconds" 'BEGIN {
-  s = int(s)
-  d = int(s / 86400)
-  h = int((s % 86400) / 3600)
-  m = int((s % 3600) / 60)
-
-  if (d > 0) {
-    printf "%dd%dh\n", d, h
-  } else if (h > 0) {
-    printf "%dh%dm\n", h, m
-  } else {
-    printf "%dm\n", m
-  }
-}'
-EOF
-}
-
-
 status_from_inode_usage() {
     local value="$1"
 
@@ -113,85 +115,6 @@ status_from_inode_usage() {
         else print "OK";
     }'
 }
-
-get_inodes() {
-    ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" 'bash -s' <<EOF 2>/dev/null
-df -Pi "$disk_mount" | awk 'NR==2 {
-  gsub(/%/, "", \$5)
-  printf "%s|%s\n", \$5, \$6
-}'
-EOF
-}
-
-get_cpu() {
-    ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" 'bash -s' <<'EOF' 2>/dev/null
-curl -fsS "http://localhost:19999/api/v1/data?chart=system.cpu" | jq -r '
-  .labels as $l |
-  .data[-1] as $d |
-  ($d[($l|index("user"))] // 0) as $user |
-  ($d[($l|index("system"))] // 0) as $system |
-  ($d[($l|index("iowait"))] // 0) as $iowait |
-  ($user + $system + $iowait) as $total |
-  "\($user)|\($system)|\($iowait)|\($total)"
-'
-EOF
-}
-
-
-get_ram() {
-    ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" 'bash -s' <<'EOF' 2>/dev/null
-curl -fsS "http://localhost:19999/api/v1/data?chart=system.ram" | jq -r '
-  .labels as $l |
-  .data[-1] as $d |
-  ($d[($l|index("used"))] // 0) as $used |
-  ($d[($l|index("free"))] // 0) as $free |
-  ($d[($l|index("cached"))] // 0) as $cached |
-  ($d[($l|index("buffers"))] // 0) as $buffers |
-  ($used + $free + $cached + $buffers) as $total_mb |
-  (if $total_mb > 0 then (($used / $total_mb) * 100) else 0 end) as $used_pct |
-  "\($used_pct)|\($total_mb)"
-'
-EOF
-}
-
-
-
-get_load() {
-    ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" 'bash -s' <<'EOF' 2>/dev/null
-read -r loadavg _ < /proc/loadavg || exit 1
-
-cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || cpus=""
-if [ -z "$cpus" ]; then
-    cpus=$(nproc 2>/dev/null) || cpus=""
-fi
-if [ -z "$cpus" ]; then
-    cpus=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null) || cpus=""
-fi
-if [ -z "$cpus" ] || [ "$cpus" -le 0 ] 2>/dev/null; then
-    cpus=1
-fi
-
-awk -v loadavg="$loadavg" -v cpus="$cpus" 'BEGIN {
-  norm = (cpus > 0) ? (loadavg / cpus) * 100 : 0
-  printf "%.2f|%d|%.0f\n", loadavg, cpus, norm
-}'
-EOF
-}
-
-
-
-get_disk() {
-    ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" 'bash -s' <<EOF 2>/dev/null
-df -P "$disk_mount" | awk 'NR==2 {
-  gsub(/%/, "", \$5)
-  printf "%s|%s|%s|%s|%s\n", \$5, \$6, \$2, \$3, \$4
-}'
-EOF
-}
-
-
-
-##### Database Profile Functions ######
 
 status_from_pg_connections() {
     local value="$1"
@@ -222,8 +145,118 @@ status_from_pg_metrics() {
     fi
 }
 
+status_from_vpn() {
+    local peers="$1"
+    local recent="$2"
+
+    if [[ "$peers" -eq 0 ]]; then
+        echo "WARNING"
+    elif [[ "$recent" -eq 0 ]]; then
+        echo "CRITICAL"
+    elif [[ "$recent" -lt "$peers" ]]; then
+        echo "WARNING"
+    else
+        echo "OK"
+    fi
+}
+
+##### Basic Functions #####
+
+get_uptime() {
+    run_remote_bash <<'EOF' 2>/dev/null
+read -r uptime_seconds _ < /proc/uptime || exit 1
+
+awk -v s="$uptime_seconds" 'BEGIN {
+  s = int(s)
+  d = int(s / 86400)
+  h = int((s % 86400) / 3600)
+  m = int((s % 3600) / 60)
+
+  if (d > 0) {
+    printf "%dd%dh\n", d, h
+  } else if (h > 0) {
+    printf "%dh%dm\n", h, m
+  } else {
+    printf "%dm\n", m
+  }
+}'
+EOF
+}
+
+get_inodes() {
+    run_remote_bash <<EOF 2>/dev/null
+df -Pi "$disk_mount" | awk 'NR==2 {
+  gsub(/%/, "", \$5)
+  printf "%s|%s\n", \$5, \$6
+}'
+EOF
+}
+
+get_cpu() {
+    run_remote_bash <<'EOF' 2>/dev/null
+curl -fsS "http://localhost:19999/api/v1/data?chart=system.cpu" | jq -r '
+  .labels as $l |
+  .data[-1] as $d |
+  ($d[($l|index("user"))] // 0) as $user |
+  ($d[($l|index("system"))] // 0) as $system |
+  ($d[($l|index("iowait"))] // 0) as $iowait |
+  ($user + $system + $iowait) as $total |
+  "\($user)|\($system)|\($iowait)|\($total)"
+'
+EOF
+}
+
+get_ram() {
+    run_remote_bash <<'EOF' 2>/dev/null
+curl -fsS "http://localhost:19999/api/v1/data?chart=system.ram" | jq -r '
+  .labels as $l |
+  .data[-1] as $d |
+  ($d[($l|index("used"))] // 0) as $used |
+  ($d[($l|index("free"))] // 0) as $free |
+  ($d[($l|index("cached"))] // 0) as $cached |
+  ($d[($l|index("buffers"))] // 0) as $buffers |
+  ($used + $free + $cached + $buffers) as $total_mb |
+  (if $total_mb > 0 then (($used / $total_mb) * 100) else 0 end) as $used_pct |
+  "\($used_pct)|\($total_mb)"
+'
+EOF
+}
+
+get_load() {
+    run_remote_bash <<'EOF' 2>/dev/null
+read -r loadavg _ < /proc/loadavg || exit 1
+
+cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || cpus=""
+if [ -z "$cpus" ]; then
+    cpus=$(nproc 2>/dev/null) || cpus=""
+fi
+if [ -z "$cpus" ]; then
+    cpus=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null) || cpus=""
+fi
+if [ -z "$cpus" ] || [ "$cpus" -le 0 ] 2>/dev/null; then
+    cpus=1
+fi
+
+awk -v loadavg="$loadavg" -v cpus="$cpus" 'BEGIN {
+  norm = (cpus > 0) ? (loadavg / cpus) * 100 : 0
+  printf "%.2f|%d|%.0f\n", loadavg, cpus, norm
+}'
+EOF
+}
+
+get_disk() {
+    run_remote_bash <<EOF 2>/dev/null
+df -P "$disk_mount" | awk 'NR==2 {
+  gsub(/%/, "", \$5)
+  printf "%s|%s|%s|%s|%s\n", \$5, \$6, \$2, \$3, \$4
+}'
+EOF
+}
+
+##### Database Profile Functions #####
+
 get_postgres() {
-    ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" 'bash -s' <<'EOF' 2>/dev/null
+    run_remote_bash <<'EOF' 2>/dev/null
 PGDATABASE=postgres
 PGUSER=remote_monitor
 PGHOST=localhost
@@ -274,11 +307,10 @@ FROM pg_stat_activity;
 EOF
 }
 
-
-##### VPN Profile Functions ######
+##### VPN Profile Functions #####
 
 get_vpn() {
-    ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" 'bash -s' <<'EOF' 2>/dev/null
+    run_remote_bash <<'EOF' 2>/dev/null
 WG_IF="wg0"
 
 if ! command -v wg >/dev/null 2>&1; then
@@ -308,28 +340,10 @@ echo "${peer_count}|${recent_count}|${WG_IF}"
 EOF
 }
 
-
-status_from_vpn() {
-    local peers="$1"
-    local recent="$2"
-
-    if [[ "$peers" -eq 0 ]]; then
-        echo "WARNING"
-    elif [[ "$recent" -eq 0 ]]; then
-        echo "CRITICAL"
-    elif [[ "$recent" -lt "$peers" ]]; then
-        echo "WARNING"
-    else
-        echo "OK"
-    fi
-}
-
-
-
 ##### Main Script Logic and Formatting #####
 
 if [[ "$mode" == "--once" ]]; then
-    if ! remote_host=$(ssh -o ConnectTimeout=3 "$remote_target" 'hostname' 2>/dev/null); then
+    if ! remote_host=$(run_remote 'hostname' 2>/dev/null); then
         remote_host="$remote_target"
     fi
 
@@ -342,143 +356,132 @@ if [[ "$mode" == "--once" ]]; then
 
     if [[ -z "$cpu_line" && -z "$ram_line" && -z "$load_line" && -z "$disk_line" ]]; then
         echo "=== ${remote_host} (${remote_target}) ==="
-	offline_colored=$(color_status "OFFLINE")
-	printf "HOST : %b\n" "$offline_colored"
-        #echo "HOST : OFFLINE"
+        offline_colored=$(color_status "OFFLINE")
+        printf "HOST : %b\n" "$offline_colored"
         exit 0
     fi
 
-    #echo "=== ${remote_host} (${remote_target}) ==="
-    
     if [[ -n "$uptime_line" ]]; then
-	echo "=== ${remote_host} (${remote_target}) | UP ${uptime_line} ==="
+        echo "=== ${remote_host} (${remote_target}) | UP ${uptime_line} ==="
     else
-    	echo "=== ${remote_host} (${remote_target}) ==="
+        echo "=== ${remote_host} (${remote_target}) ==="
     fi
 
     if [[ -n "$cpu_line" ]]; then
         IFS='|' read -r cpu_user cpu_system cpu_iowait cpu_total <<< "$cpu_line"
         cpu_status=$(status_from_thresholds "$cpu_total" 20 70)
+        cpu_status_colored=$(color_status "$cpu_status")
 
-	cpu_status_colored=$(color_status "$cpu_status")
-	printf "CPU  : %-9b user=%.1f%% system=%.1f%% iowait=%.1f%% total=%.1f%%\n" \
-    	    "$cpu_status_colored" "$cpu_user" "$cpu_system" "$cpu_iowait" "$cpu_total"
+        printf "CPU  : %-9b user=%.1f%% system=%.1f%% iowait=%.1f%% total=%.1f%%\n" \
+            "$cpu_status_colored" "$cpu_user" "$cpu_system" "$cpu_iowait" "$cpu_total"
     else
-        echo "CPU  : UNKNOWN  unavailable"
+        echo "CPU  : UNKNOWN   unavailable"
     fi
 
     if [[ -n "$ram_line" ]]; then
         IFS='|' read -r ram_used_pct ram_total_mb <<< "$ram_line"
         ram_total_gib=$(awk -v t="$ram_total_mb" 'BEGIN { printf "%.2f", t/1024 }')
         ram_status=$(status_from_thresholds "$ram_used_pct" 70 90)
+        ram_status_colored=$(color_status "$ram_status")
 
-	ram_status_colored=$(color_status "$ram_status")
-
-
-	printf "RAM  : %-9b used=%.0f%% total=%s GiB\n" \
+        printf "RAM  : %-9b used=%.0f%% total=%s GiB\n" \
             "$ram_status_colored" "$ram_used_pct" "$ram_total_gib"
-
     else
-        echo "RAM  : UNKNOWN  unavailable"
+        echo "RAM  : UNKNOWN   unavailable"
     fi
 
     if [[ -n "$load_line" ]]; then
         IFS='|' read -r load1 cpus load_norm <<< "$load_line"
         load_status=$(status_from_thresholds "$load_norm" 70 100)
+        load_status_colored=$(color_status "$load_status")
 
-
-	load_status_colored=$(color_status "$load_status")
-	printf "LOAD : %-9b load1=%s cpus=%s normalized=%s%%\n" \
+        printf "LOAD : %-9b load1=%s cpus=%s normalized=%s%%\n" \
             "$load_status_colored" "$load1" "$cpus" "$load_norm"
     else
-        echo "LOAD : UNKNOWN  unavailable"
+        echo "LOAD : UNKNOWN   unavailable"
     fi
 
     if [[ -n "$disk_line" ]]; then
         IFS='|' read -r disk_used_pct disk_mount_out disk_size_k disk_used_k disk_avail_k <<< "$disk_line"
         disk_status=$(status_from_thresholds "$disk_used_pct" 80 90)
-	disk_status_colored=$(color_status "$disk_status")
+        disk_status_colored=$(color_status "$disk_status")
 
-	printf "DISK : %-9b used=%s%% mount=%s\n" \
+        printf "DISK : %-9b used=%s%% mount=%s\n" \
             "$disk_status_colored" "$disk_used_pct" "$disk_mount_out"
     else
-        echo "DISK : UNKNOWN  unavailable"
-    
+        echo "DISK : UNKNOWN   unavailable"
     fi
 
-        if [[ -n "$inode_line" ]]; then
+    if [[ -n "$inode_line" ]]; then
         IFS='|' read -r inode_used_pct inode_mount_out <<< "$inode_line"
         inode_status=$(status_from_inode_usage "$inode_used_pct")
         inode_status_colored=$(color_status "$inode_status")
 
-	printf "INOD : %-9b used=%s%% mount=%s\n" \
+        printf "INOD : %-9b used=%s%% mount=%s\n" \
             "$inode_status_colored" "$inode_used_pct" "$inode_mount_out"
     else
-        echo "INOD : UNKNOWN  unavailable"
+        echo "INOD : UNKNOWN   unavailable"
     fi
 
-	if [[ "$profile" == "db" ]]; then
-		pg_line=$(get_postgres || true)
+    if [[ "$profile" == "db" ]]; then
+        pg_line=$(get_postgres || true)
 
-		if [[ -z "$pg_line" ]]; then
-			echo "PG   : UNKNOWN  unavailable"
-		elif [[ "$pg_line" == "DOWN" ]]; then
-			pg_status_colored=$(color_status "CRITICAL")
-			printf "PG   : %-9b down\n" "$pg_status_colored"
-		elif [[ "$pg_line" == UNKNOWN\|* ]]; then
-			pg_reason="${pg_line#UNKNOWN|}"
-			printf "PG   : %-9s %s\n" "UNKNOWN" "$pg_reason"
-		elif [[ "$pg_line" == UP\|* ]]; then
-			IFS='|' read -r pg_state \
-				pg_total_field \
-				pg_max_field \
-				pg_active_field \
-				pg_idle_field \
-				pg_idle_tx_field \
-				pg_long_q_field \
-				pg_blocked_field <<< "$pg_line"
+        if [[ -z "$pg_line" ]]; then
+            echo "PG   : UNKNOWN   unavailable"
+        elif [[ "$pg_line" == "DOWN" ]]; then
+            pg_status_colored=$(color_status "CRITICAL")
+            printf "PG   : %-9b down\n" "$pg_status_colored"
+        elif [[ "$pg_line" == UNKNOWN\|* ]]; then
+            pg_reason="${pg_line#UNKNOWN|}"
+            printf "PG   : %-9s %s\n" "UNKNOWN" "$pg_reason"
+        elif [[ "$pg_line" == UP\|* ]]; then
+            IFS='|' read -r pg_state \
+                pg_total_field \
+                pg_max_field \
+                pg_active_field \
+                pg_idle_field \
+                pg_idle_tx_field \
+                pg_long_q_field \
+                pg_blocked_field <<< "$pg_line"
 
-			pg_total="${pg_total_field#total=}"
-			pg_max="${pg_max_field#max=}"
-			pg_active="${pg_active_field#active=}"
-			pg_idle="${pg_idle_field#idle=}"
-			pg_idle_tx="${pg_idle_tx_field#idle_tx=}"
-			pg_long_q="${pg_long_q_field#long_q=}"
-			pg_blocked="${pg_blocked_field#blocked=}"
+            pg_total="${pg_total_field#total=}"
+            pg_max="${pg_max_field#max=}"
+            pg_active="${pg_active_field#active=}"
+            pg_idle="${pg_idle_field#idle=}"
+            pg_idle_tx="${pg_idle_tx_field#idle_tx=}"
+            pg_long_q="${pg_long_q_field#long_q=}"
+            pg_blocked="${pg_blocked_field#blocked=}"
 
-			pg_used_pct=$(awk -v c="$pg_total" -v m="$pg_max" 'BEGIN {
-				if (m > 0) printf "%.0f", (c/m)*100;
-				else print 0
-			}')
+            pg_used_pct=$(awk -v c="$pg_total" -v m="$pg_max" 'BEGIN {
+                if (m > 0) printf "%.0f", (c/m)*100;
+                else print 0
+            }')
 
-			pg_status=$(status_from_pg_metrics "$pg_used_pct" "$pg_idle_tx" "$pg_long_q" "$pg_blocked")
-			pg_status_colored=$(color_status "$pg_status")
+            pg_status=$(status_from_pg_metrics "$pg_used_pct" "$pg_idle_tx" "$pg_long_q" "$pg_blocked")
+            pg_status_colored=$(color_status "$pg_status")
 
-			printf "PG   : %-9b conns=%s/%s used=%s%% active=%s idle=%s idle_tx=%s long_q=%s blocked=%s\n" \
-				"$pg_status_colored" \
-				"$pg_total" "$pg_max" "$pg_used_pct" \
-				"$pg_active" "$pg_idle" "$pg_idle_tx" "$pg_long_q" "$pg_blocked"
-		else
-			printf "PG   : %-9s %s\n" "UNKNOWN" "unexpected_output"
-		fi
-	fi
+            printf "PG   : %-9b conns=%s/%s used=%s%% active=%s idle=%s idle_tx=%s long_q=%s blocked=%s\n" \
+                "$pg_status_colored" \
+                "$pg_total" "$pg_max" "$pg_used_pct" \
+                "$pg_active" "$pg_idle" "$pg_idle_tx" "$pg_long_q" "$pg_blocked"
+        else
+            printf "PG   : %-9s %s\n" "UNKNOWN" "unexpected_output"
+        fi
+    fi
 
-	if [[ "$profile" == "vpn" ]]; then
-      		vpn_line=$(get_vpn || true)
+    if [[ "$profile" == "vpn" ]]; then
+        vpn_line=$(get_vpn || true)
 
         if [[ -z "$vpn_line" ]]; then
-            echo "VPN  : UNKNOWN  unavailable"
-        
-    	elif [[ "$vpn_line" == UNKNOWN\|* ]]; then
+            echo "VPN  : UNKNOWN   unavailable"
+        elif [[ "$vpn_line" == UNKNOWN\|* ]]; then
             vpn_reason="${vpn_line#UNKNOWN|}"
             printf "VPN  : %-9s %s\n" "UNKNOWN" "$vpn_reason"
-        
-    	elif [[ "$vpn_line" == DOWN\|* ]]; then
+        elif [[ "$vpn_line" == DOWN\|* ]]; then
             vpn_reason="${vpn_line#DOWN|}"
             vpn_status_colored=$(color_status "CRITICAL")
             printf "VPN  : %-9b %s\n" "$vpn_status_colored" "$vpn_reason"
-        
-    	else
+        else
             IFS='|' read -r vpn_peers vpn_recent vpn_if <<< "$vpn_line"
             vpn_status=$(status_from_vpn "$vpn_peers" "$vpn_recent")
             vpn_status_colored=$(color_status "$vpn_status")
@@ -496,10 +499,3 @@ fi
 if [[ "$mode" != "--once" ]]; then
     watch -n 2 -t -- "$0 $remote_target --once \"$disk_mount\" --profile \"$profile\""
 fi
-
-#The below was causing the script to flash slowly
-#while true; do
-#    clear
-#    "$0" "$remote_target" --once "$disk_mount" --profile "$profile"
-#    sleep 2
-#done
