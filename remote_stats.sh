@@ -302,7 +302,8 @@ SELECT
   || '|blocked=' || count(*) FILTER (
        WHERE wait_event_type = 'Lock'
      )
-FROM pg_stat_activity;
+FROM pg_stat_activity
+WHERE pid <> pg_backend_pid();
 " 2>/dev/null || echo "UNKNOWN|query_failed"
 EOF
 }
@@ -392,7 +393,7 @@ if [[ "$mode" == "--once" ]]; then
 
     if [[ -n "$load_line" ]]; then
         IFS='|' read -r load1 cpus load_norm <<< "$load_line"
-        load_status=$(status_from_thresholds "$load_norm" 70 100)
+	load_status=$(status_from_thresholds "$load_norm" 100 200)
         load_status_colored=$(color_status "$load_status")
 
         printf "LOAD : %-9b load1=%s cpus=%s normalized=%s%%\n" \
