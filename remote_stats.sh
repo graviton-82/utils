@@ -146,17 +146,14 @@ status_from_pg_metrics() {
 }
 
 status_from_vpn() {
-    local peers="$1"
-    local recent="$2"
+    local newest="$1"
 
-    if [[ "$peers" -eq 0 ]]; then
+    if [[ -z "$newest" || "$newest" == "never" || "$newest" == "null" ]]; then
         echo "WARNING"
-    elif [[ "$recent" -eq 0 ]]; then
-        echo "CRITICAL"
-    elif [[ "$recent" -lt "$peers" ]]; then
-        echo "WARNING"
+    elif (( newest <= 600 )); then
+        echo "HEALTHY"
     else
-        echo "OK"
+        echo "WARNING"
     fi
 }
 
@@ -313,6 +310,13 @@ EOF
 get_vpn() {
     run_remote_bash <<'EOF' 2>/dev/null
 WG_IF="wg0"
+
+dump=$(ssh vpnadmin@192.168.1.169 "sudo -n /usr/local/bin/wg-dashboard-stats")
+
+if ! dump=$(sudo -n /usr/local/bin/wg-dashboard-stats 2>/dev/null); then
+    echo "UNKNOWN|sudo access to wg-dashboard-stats unavailable"
+    return 0
+fi
 
 if ! command -v wg >/dev/null 2>&1; then
     echo "UNKNOWN|wg_missing"
@@ -471,24 +475,33 @@ if [[ "$mode" == "--once" ]]; then
     fi
 
     if [[ "$profile" == "vpn" ]]; then
-        vpn_line=$(get_vpn || true)
+        vpn_line=$(get_vpn || true) 
 
-        if [[ -z "$vpn_line" ]]; then
-            echo "VPN  : UNKNOWN   unavailable"
-        elif [[ "$vpn_line" == UNKNOWN\|* ]]; then
-            vpn_reason="${vpn_line#UNKNOWN|}"
-            printf "VPN  : %-9s %s\n" "UNKNOWN" "$vpn_reason"
+        if [[ -z "$vpn_line" ]]; then 
+          vpn_status_colored=$(color_status "UNKNOWN") 
+          printf "VPN  : %-9b unavailable\n" "$vpn_status_colored"
+
+        elif [[ "$vpn_line" == UNKNOWN\|* ]]; then 
+          vpn_reason="${vpn_line#UNKNOWN|}"
+          vpn_status_colored=$(color_status "UNKNOWN")
+          printf "VPN  : %-9b %s\n" "$vpn_status_colored" "$vpn_reason" 
+
         elif [[ "$vpn_line" == DOWN\|* ]]; then
-            vpn_reason="${vpn_line#DOWN|}"
-            vpn_status_colored=$(color_status "CRITICAL")
-            printf "VPN  : %-9b %s\n" "$vpn_status_colored" "$vpn_reason"
-        else
-            IFS='|' read -r vpn_peers vpn_recent vpn_if <<< "$vpn_line"
-            vpn_status=$(status_from_vpn "$vpn_peers" "$vpn_recent")
-            vpn_status_colored=$(color_status "$vpn_status")
+          vpn_reason="${vpn_line#DOWN|}"
+          vpn_status_colored=$(color_status "CRITICAL") 
+          printf "VPN  : %-9b %s\n" "$vpn_status_colored" "$vpn_reason" 
 
-            printf "VPN  : %-9b iface=%s peers=%s recent=%s\n" \
-                "$vpn_status_colored" "$vpn_if" "$vpn_peers" "$vpn_recent"
+        else 
+          IFS='|' read -r vpn_total vpn_active vpn_newest vpn_if <<< "$vpn_line" 
+          vpn_status=$(status_from_vpn "$vpn_newest") 
+          vpn_status_colored=$(color_status "$vpn_status")
+
+          printf "VPN  : %-9b iface=%s active=%s/%s newest=%ss\n" \
+            "$vpn_status_colored" \
+            "$vpn_if" \
+            "$vpn_active" \
+            "$vpn_total" \
+            "$vpn_newest"
         fi
     fi
 
