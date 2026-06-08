@@ -76,6 +76,9 @@ color_status() {
         OK)
             printf "${GREEN}%s${RESET}" "$status"
             ;;
+        HEALTHY)
+            printf "${GREEN}%s${RESET}" "$status"
+            ;;
         WARNING)
             printf "${YELLOW}%s${RESET}" "$status"
             ;;
@@ -148,7 +151,7 @@ status_from_pg_metrics() {
 status_from_vpn() {
     local newest="$1"
 
-    if [[ -z "$newest" || "$newest" == "never" || "$newest" == "null" ]]; then
+    if [[ ! "$newest" =~ ^[0-9]+$ ]]; then
         echo "WARNING"
     elif (( newest <= 600 )); then
         echo "HEALTHY"
@@ -307,19 +310,20 @@ EOF
 
 ##### VPN Profile Functions #####
 
+##### VPN Profile Functions #####
+
 get_vpn() {
     run_remote_bash <<'EOF' 2>/dev/null
 WG_IF="wg0"
+RECENT_THRESHOLD=600
 
-dump=$(ssh vpnadmin@192.168.1.169 "sudo -n /usr/local/bin/wg-dashboard-stats")
-
-if ! dump=$(sudo -n /usr/local/bin/wg-dashboard-stats 2>/dev/null); then
-    echo "UNKNOWN|sudo access to wg-dashboard-stats unavailable"
-    return 0
+if ! command -v sudo >/dev/null 2>&1; then
+    echo "UNKNOWN|sudo_missing"
+    exit 0
 fi
 
-if ! command -v wg >/dev/null 2>&1; then
-    echo "UNKNOWN|wg_missing"
+if ! command -v ip >/dev/null 2>&1; then
+    echo "UNKNOWN|ip_missing"
     exit 0
 fi
 
@@ -328,20 +332,50 @@ if ! ip link show "$WG_IF" >/dev/null 2>&1; then
     exit 0
 fi
 
-peer_count=$(wg show "$WG_IF" peers 2>/dev/null | awk 'NF {count++} END {print count+0}')
-recent_count=$(wg show "$WG_IF" latest-handshakes 2>/dev/null | awk '
-BEGIN {
-    now = systime()
-    recent = 0
-}
-NF >= 2 {
-    if ($2 > 0 && (now - $2) <= 180) recent++
-}
-END {
-    print recent+0
-}')
+if ! dump=$(sudo -n /usr/local/bin/wg-dashboard-stats 2>/dev/null); then
+    echo "CRITICAL|sudo access to wg-dashboard-stats unavailable"
+    exit 0
+fi
 
-echo "${peer_count}|${recent_count}|${WG_IF}"
+read -r peer_count active_count newest_age < <(
+    printf '%s\n' "$dump" |
+    awk -v threshold="$RECENT_THRESHOLD" '
+    BEGIN {
+        now = systime()
+        peers = 0
+        active = 0
+        newest = -1
+    }
+
+    # Skip interface line. Peer lines have:
+    # public-key preshared-key endpoint allowed-ips latest-handshake rx tx keepalive
+    NR > 1 && NF >= 8 {
+        peers++
+
+        handshake = $5
+
+        if (handshake > 0) {
+            age = now - handshake
+
+            # Protect against small clock mismatch
+            if (age < 0) age = 0
+
+            if (age <= threshold) active++
+
+            if (newest == -1 || age < newest) {
+                newest = age
+            }
+        }
+    }
+
+    END {
+        if (newest == -1) newest = 999999
+        print peers, active, newest
+    }'
+)
+
+echo "${peer_count}|${active_count}|${newest_age}|${WG_IF}"
+
 EOF
 }
 
