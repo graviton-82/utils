@@ -26,7 +26,7 @@ sudo visudo -f /etc/sudoers.d/wg-dashboard
 ```
 Add:
 ```bash
-vpnadmin ALL=(root) NOPASSWD: /usr/local/bin/wg-dashboard-stats  
+[ssh-user] ALL=(root) NOPASSWD: /usr/local/bin/wg-dashboard-stats  
 ```
 Then test remotely:
 ```bash
