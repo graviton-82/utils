@@ -47,7 +47,7 @@ Designed for:
 Install Netdata on each monitored host:
 
 ```bash
-bash <(curl -Ss https://my-netdata.io/kickstart.sh)
+curl https://get.netdata.cloud/kickstart.sh > /tmp/netdata-kickstart.sh && sh /tmp/netdata-kickstart.sh
 ```
 
 On Offline hosts:
