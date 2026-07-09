@@ -47,7 +47,7 @@ Designed for:
 Install Netdata on each monitored host:
 
 ```bash
-bash <(curl -Ss https://my-netdata.io/kickstart.sh)
+curl https://get.netdata.cloud/kickstart.sh > /tmp/netdata-kickstart.sh && sh /tmp/netdata-kickstart.sh
 ```
 
 On Offline hosts:
@@ -260,19 +260,62 @@ ssh user@host 'jq --version'
 
 ---
 
-## 🔭 Future Improvements
+### Example SSH Configuration
 
-* `--no-color` flag
-* `--brief` mode (single-line output)
-* multi-host wrapper (`fleet_stats.sh`)
-* role-based metrics (e.g., `--postgres`)
-* tmux dashboard launcher
+```sshconfig
+Host access-vm
+    HostName private.network.com
+    User access-user
+    IdentityFile ~/access_keys/key-file.pem
 
----
+Host private-vm
+    HostName 10.10.10.20
+    User private-user
+    ProxyJump access-vm
 
-## 📁 Source
+Host db-vm
+    HostName 192.168.1.150
+    User db-user
 
-Script: 
+Host vpn-vm
+    HostName 192.168.1.149
+    User vpn-user
+```
+
+### Usage
+
+After configuring SSH aliases, hosts may be monitored using their alias name:
+
+```bash
+./remote_stats.sh db-vm
+./remote_stats.sh vpn-vm --profile vpn
+./remote_stats.sh private-vm
+```
+
+The monitoring script does not need to know whether a host is local, remote, cloud-hosted, or accessed through a jump host. All connection handling is delegated to OpenSSH.
+
+### Localhost Monitoring
+
+The special targets below bypass SSH and execute monitoring commands locally:
+
+```text
+localhost
+127.0.0.1
+$(hostname)
+```
+
+Example:
+
+```bash
+./remote_stats.sh localhost
+```
+
+This allows the monitoring host itself to be monitored using the same interface and output format as remote systems.
+
+### Connection Tuning
+
+The script centralizes SSH options in a shared helper. If cloud-hosted systems or jump-host chains require additional connection time, increase the configured `ConnectTimeout` value rather than modifying individual monitoring functions.
+
 
 ---
 
@@ -285,3 +328,24 @@ Run in tmux:
 ./remote_stats.sh host2
 ./remote_stats.sh host3
 ```
+## SSH Configuration and Jump Hosts
+
+`remote_stats.sh` relies on the local OpenSSH client for all remote connectivity. Host-specific connection settings should be configured in `~/.ssh/config` rather than embedded in the script.
+
+### Benefits
+
+* Supports SSH keys without modifying the script
+* Supports non-standard ports
+* Supports bastion/jump hosts (`ProxyJump`)
+* Supports cloud VMs and VPN-only hosts
+* Keeps monitoring logic separate from connection logic
+
+---
+
+## 🔭 Future Improvements
+
+* `--no-color` flag
+* `--brief` mode (single-line output)
+* multi-host wrapper (`fleet_stats.sh`)
+* role-based metrics (e.g., `--postgres`)
+* tmux dashboard launcher
