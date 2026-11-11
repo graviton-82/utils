@@ -1,74 +1,53 @@
-To avoid adding the user to the sudo group and/or using passwordless sudo for commands requiring root access use the following steps.
+# WireGuard monitoring helper
 
-On the VPN server, create a helper script with sudo access. 
+The VPN profile uses a root-owned helper that returns only:
 
-create file with:
-```bash
-sudo nano /usr/local/bin/wg-dashboard-stats  
+```text
+peer_count|recent_peer_count|newest_handshake_age_seconds
 ```
 
-Put:
-```bash
-#!/usr/bin/env bash  
-set -euo pipefail  
+A newest age of `-1` means there are no handshake timestamps. The helper queries
+`wg show INTERFACE latest-handshakes`, aggregates in the privileged process, and
+never returns raw dumps, private keys, preshared keys, or peer identifiers.
 
-/usr/bin/wg show wg0 dump
-```
-Then:
-```bash
-sudo chown root:root /usr/local/bin/wg-dashboard-stats  
-sudo chmod 755 /usr/local/bin/wg-dashboard-stats  
-```
-Create a sudoers rule:
+Install the checked-in helper **on the VPN server**, replacing any previous
+raw-dump version. These commands require administrative access:
 
 ```bash
-sudo visudo -f /etc/sudoers.d/wg-dashboard  
+sudo install -o root -g root -m 0755 helpers/wg-dashboard-stats /usr/local/bin/wg-dashboard-stats
+sudo visudo -f /etc/sudoers.d/wg-dashboard
 ```
-Add:
+
+Replace `monitor_user` with the SSH account and add:
+
+```sudoers
+monitor_user ALL=(root) NOPASSWD: /usr/local/bin/wg-dashboard-stats
+```
+
+This rule permits helper arguments. The helper accepts only a validated interface
+name and a positive integer handshake window; it invokes fixed absolute command
+paths and returns only aggregates. The account can inspect aggregates for other
+WireGuard interfaces too. If policy requires one interface only, install a
+root-owned wrapper fixing those arguments and use a matching sudoers restriction.
+
+Ensure `/usr/local/bin`, the helper, and its ancestors are root-owned and not
+writable by the monitoring account or its groups. The helper expects `/bin/bash`,
+`/usr/bin/wg`, and `/usr/bin/awk`; verify these paths on the server. Do not grant
+passwordless access to a user-writable copy or to unrestricted `wg`.
+
+Test as the SSH account:
+
 ```bash
-[ssh-user] ALL=(root) NOPASSWD: /usr/local/bin/wg-dashboard-stats  
+sudo -n /usr/local/bin/wg-dashboard-stats wg0 600
 ```
-Then test remotely:
-```bash
-ssh [user]@[ip-address] "sudo -n /usr/local/bin/wg-dashboard-stats"  
-```
-you can now use the --profile vpn flag
+
+Then run from the monitoring machine:
 
 ```bash
-##### Future OS Detection Helpers #####
-
-get_remote_os() {
-    if is_local_target "$remote_target"; then
-        uname -s 2>/dev/null || echo "Unknown"
-        return
-    fi
-
-    # Linux / BSD / macOS
-    if run_remote 'uname -s' >/dev/null 2>&1; then
-        run_remote 'uname -s'
-        return
-    fi
-
-    # Windows via OpenSSH
-    if run_remote 'powershell -NoProfile -Command "$env:OS"' >/dev/null 2>&1; then
-        echo "Windows"
-        return
-    fi
-
-    echo "Unknown"
-}
-
-is_windows_target() {
-    [[ "$(get_remote_os)" == "Windows" ]]
-}
-
-is_linux_target() {
-    local os
-    os="$(get_remote_os)"
-
-    [[ "$os" == "Linux" || \
-       "$os" == "Darwin" || \
-       "$os" == "FreeBSD" ]]
-}
+./remote_stats.sh vpn-vm --profile vpn --once
+RS_WG_INTERFACE=wg1 RS_WG_RECENT=300 ./remote_stats.sh vpn-vm --profile vpn --once
 ```
 
+Both script and helper must use the aggregate protocol. A helper failure produces
+`CRITICAL helper_unavailable`; malformed output produces `UNKNOWN invalid_response`.
+An existing interface with no recent handshakes is reported as idle, not failed.

@@ -1,351 +1,183 @@
+# remote_stats.sh
 
-# 📊 `remote_stats.sh`
+## Requirements and setup
 
-A lightweight CLI tool for monitoring remote Linux hosts over SSH using Netdata.
+The local machine needs Bash 4+, GNU coreutils `timeout`, and an OpenSSH client
+for remote targets. `--json` also requires local `jq`. The monitored Linux host
+needs Bash 4+, curl, jq, awk, hostname, df, getconf, and readable `/proc` files.
+Local monitoring requires those collector dependencies on the local machine.
 
-Designed for:
-
-* quick diagnostics
-* tmux dashboards
-* low-overhead environments
-* no central monitoring stack required
-
----
-
-## 🚀 Features
-
-* SSH-based (no agents beyond Netdata)
-* Works across Debian, Ubuntu, Fedora
-* Minimal dependencies (`jq`, `awk`, `ssh`)
-* Real-time monitoring via `watch`
-* Clean, structured output
-* Color-coded status indicators
-
----
-
-## 📦 Requirements
-
-### Local machine
-
-* `bash`
-* `ssh`
-* `jq`
-* `awk`
-
-### Remote host
-
-* Netdata running on port `19999`
-* `bash`
-* `curl`
-* `jq`
-* `awk`
-
----
-
-## ⚙️ Netdata Setup (Remote Hosts)
-
-Install Netdata on each monitored host:
+Install and run Netdata using the installation procedure for your distribution.
+Its API must be reachable **on the monitored host** at `http://localhost:19999`.
+It does not need to be exposed to the network. Test on that host:
 
 ```bash
-curl https://get.netdata.cloud/kickstart.sh > /tmp/netdata-kickstart.sh && sh /tmp/netdata-kickstart.sh
+curl -fsS http://localhost:19999/api/v1/info
 ```
 
-On Offline hosts:
-```bash
-wget -O /tmp/netdata-kickstart.sh https://get.netdata.cloud/kickstart.sh
-sh /tmp/netdata-kickstart.sh --release-channel stable --prepare-offline-install-source ./netdata-offline
-```
-Then transfer with scp (or equivalent)
-
-More info:
-https://learn.netdata.cloud/docs/netdata-agent/installation/linux/offline-systems
-
-Note: 
-Offline systems my install outside of your path. i.e.
-/opt/netdata/bin/netdata 
-/opt/netdata/etc/netdata/netdata.conf
-
-find with: 
-```bash
-whereis
-```
-If necessary.
-
-Verify it is running:
-
-```bash
-systemctl status netdata
-```
-
-Test locally on the host:
-
-```bash
-curl http://localhost:19999/api/v1/info
-```
-
-No external exposure is required—this script uses:
-
-```text
-SSH → localhost:19999
-```
-
----
-
-## 🔐 SSH Setup
-
-Passwordless SSH is strongly recommended:
-
-```bash
-ssh-keygen -t ed25519
-ssh-copy-id user@remote-host
-```
-
-Test:
-
-```bash
-ssh user@remote-host hostname
-```
-
----
-
-## 🧪 Usage
-
-### One-shot (single run)
-
-```bash
-./remote_stats.sh user@ip --once
-```
-
-### Continuous monitoring (default)
-
-```bash
-./remote_stats.sh user@ip
-```
-
-### Specify disk mount
-
-```bash
-./remote_stats.sh user@ip --once /var/lib/postgresql
-```
-
----
-
-## 📈 Output Format
-
-```text
-=== hostname (user@ip) ===
-CPU  : OK       user=2.0% system=3.2% iowait=0.1% total=5.2%
-RAM  : OK       used=23% total=7.34 GiB
-LOAD : OK       load1=0.35 cpus=8 normalized=4%
-DISK : OK       used=17% mount=/
-```
-
-### Status Levels
-
-| Status   | Meaning                 |
-| -------- | ----------------------- |
-| OK       | Healthy                 |
-| WARNING  | Moderate pressure       |
-| CRITICAL | High load / near limits |
-| OFFLINE  | Host unreachable        |
-| UNKNOWN  | Metric unavailable      |
-
----
-
-## 🎨 Color Coding
-
-Only the **status field** is colored:
-
-* 🟢 OK → green
-* 🟡 WARNING → yellow
-* 🔴 CRITICAL / OFFLINE → red
-
-Works well in:
-
-* tmux
-* terminal dashboards
-
----
-
-## 🧠 Metrics Explained
-
-### CPU
-
-* `user`: user-space processes
-* `system`: kernel activity
-* `iowait`: waiting on disk/network
-* `total`: sum of above
-
-### RAM
-
-* Derived from:
-
-  * `used`
-  * `free`
-  * `cached`
-  * `buffers`
-* Shows:
-
-  * used %
-  * total memory (GiB)
-
-### LOAD
-
-* 1-minute load average
-* normalized by CPU count:
-
-```text
-normalized = load1 / cpus * 100
-```
-
-### DISK
-
-* Uses `df -P`
-* Reports:
-
-  * used %
-  * mount point
-
----
-
-## 🧱 Design Philosophy
-
-This tool is:
-
-* **stateless** → no history, only live data
-* **pull-based** → SSH into hosts
-* **minimal** → avoids heavy monitoring stacks
-* **composable** → works well with tmux, scripts
-
-It is **not**:
-
-* a full monitoring system
-* a metrics database
-* a replacement for Prometheus/Grafana
-
----
-
-## ⚠️ Limitations
-
-* Requires SSH access
-* No historical data
-* No alerting
-* Dependent on Netdata being available locally
-
----
-
-## 🛠️ Troubleshooting
-
-### Host shows `OFFLINE`
-
-```bash
-ssh user@host hostname
-```
-
-### Metrics show `UNKNOWN`
-
-Test Netdata:
-
-```bash
-ssh user@host 'curl http://localhost:19999/api/v1/data?chart=system.cpu'
-```
-
-### JSON parsing issues
-
-Check `jq`:
-
-```bash
-ssh user@host 'jq --version'
-```
-
----
-
-### Example SSH Configuration
+Configure SSH authentication and host keys before monitoring. The script uses
+batch authentication and will not prompt for passwords or new host keys. SSH
+aliases, ports, identity files, and `ProxyJump` belong in `~/.ssh/config`:
 
 ```sshconfig
-Host access-vm
-    HostName private.network.com
-    User access-user
-    IdentityFile ~/access_keys/key-file.pem
-
-Host private-vm
-    HostName 10.10.10.20
-    User private-user
-    ProxyJump access-vm
-
 Host db-vm
-    HostName 192.168.1.150
-    User db-user
-
-Host vpn-vm
-    HostName 192.168.1.149
-    User vpn-user
+    HostName 10.0.0.20
+    User monitor
+    IdentityFile ~/.ssh/id_ed25519
+    ProxyJump bastion
 ```
 
-### Usage
+`localhost`, `127.0.0.1`, and the output of `hostname` bypass SSH. Other targets,
+including other names for this host, use SSH. Hosts must run Linux; macOS,
+FreeBSD, and Windows collectors are not implemented.
 
-After configuring SSH aliases, hosts may be monitored using their alias name:
+## Usage
 
 ```bash
-./remote_stats.sh db-vm
-./remote_stats.sh vpn-vm --profile vpn
-./remote_stats.sh private-vm
+./remote_stats.sh user@server --once
+./remote_stats.sh db-vm /var/lib/postgresql --profile db --once
+./remote_stats.sh vpn-vm --profile vpn --interval 5
+./remote_stats.sh localhost --json
+./remote_stats.sh localhost --once --debug --no-color
+./remote_stats.sh --help
 ```
 
-The monitoring script does not need to know whether a host is local, remote, cloud-hosted, or accessed through a jump host. All connection handling is delegated to OpenSSH.
+The first positional argument is the target; the optional second is a filesystem
+path (default `/`). Quote paths containing spaces or shell characters. Newlines,
+carriage returns, and `|` in paths are rejected. Unknown options, extra positional
+arguments, invalid profiles, and missing option values are errors.
 
-### Localhost Monitoring
+| Option | Meaning |
+| --- | --- |
+| `--once` | Collect and display one snapshot. |
+| `--profile base\|db\|vpn` | Select base metrics or additional service metrics. |
+| `--interval SECONDS` | Positive integer delay between snapshots, default 2. |
+| `--timeout SECONDS` | Positive integer overall collection deadline, default 30. |
+| `--no-color` | Disable ANSI color. Redirected output and `NO_COLOR` also disable it. |
+| `--json` | Emit a JSON snapshot; implies `--once` and disables color. |
+| `--debug` | Print sanitized failure tokens and transport exit codes to stderr. |
+| `--help` | Display usage. |
 
-The special targets below bypass SSH and execute monitoring commands locally:
+Refresh mode clears an interactive terminal between snapshots. Redirected output
+appends snapshots. The interval is a delay **after** collection; it is not a fixed
+sampling period. Interrupt with Ctrl-C. No `watch` dependency is needed.
 
-```text
-localhost
-127.0.0.1
-$(hostname)
-```
+## Metrics and status
 
-Example:
+A snapshot includes uptime in the heading and CPU, RAM, LOAD, DISK, and INOD rows.
+CPU and RAM use the sample with the greatest timestamp in the returned Netdata
+response; absent or invalid required dimensions produce `UNKNOWN`.
 
-```bash
-./remote_stats.sh localhost
-```
+- CPU total is explicitly **user + system + iowait**. Other CPU states are not
+  included; it is not an all-states utilization measure.
+- RAM usage is `used / (used + free + cached + buffers)`; total is displayed in GiB
+  assuming Netdata's standard MiB dimensions. A zero total is invalid.
+- LOAD reports one-minute load, online CPU count, and `load / CPUs * 100`.
+- DISK and INOD report space and inode percentages for the requested path. The
+  displayed path is the requested path, which may be inside the filesystem.
+- PostgreSQL reports other client backends against `max_connections`, excluding
+  this monitoring session and background workers. Reserved slots mean this is
+  an approximate capacity indicator, not the number of usable remaining slots.
+- VPN reports interface existence separately from peer activity. An existing
+  interface with old or absent handshakes is `OK` with `idle_or_no_handshake`;
+  inactivity alone does not prove a fault. `newest=-1s` means no peer has a
+  handshake timestamp. A missing interface is `CRITICAL`.
 
-This allows the monitoring host itself to be monitored using the same interface and output format as remote systems.
+Threshold comparisons are inclusive (`>=`). Defaults:
 
-### Connection Tuning
+| Metric | Warning | Critical |
+| --- | --- | --- |
+| CPU | 20% | 70% |
+| RAM | 70% | 90% |
+| Normalized load | 100% | 200% |
+| Disk and inodes | 80% | 90% |
+| PostgreSQL connections | 80% | 90% |
 
-The script centralizes SSH options in a shared helper. If cloud-hosted systems or jump-host chains require additional connection time, increase the configured `ConnectTimeout` value rather than modifying individual monitoring functions.
+Blocked PostgreSQL clients are critical. Transactions idle over 60 seconds and
+active queries over 60 seconds are warnings unless another condition is critical.
+A server not accepting connections is critical; query/authentication failures
+are unknown. A successful readiness probe does not validate monitoring access.
 
+`OFFLINE` means no valid host header was received before transport failed or the
+deadline elapsed; this does not prove the machine is powered off. Once the host
+header arrives, failed collectors produce `UNKNOWN`, retaining available rows.
 
----
+Exit codes for one snapshot:
 
-## 💡 Example Use Case
+- `0`: collection completed, including successfully observed unhealthy services.
+- `1`: collection incomplete, transport failed, or privileged VPN helper failed.
+- `2`: invalid invocation/configuration or missing local prerequisite.
 
-Run in tmux:
+Refresh mode continues through collection errors. SIGINT exits 130; SIGTERM exits
+143. No health-based exit mode is provided; automation should inspect statuses.
 
-```bash
-./remote_stats.sh host1
-./remote_stats.sh host2
-./remote_stats.sh host3
-```
-## SSH Configuration and Jump Hosts
+JSON contains `target`, `host`, `uptime`, and a `metrics` array of
+`{name, status, detail}` records. Details are readable strings; they are not a
+stable numeric metrics API. Uptime is an empty string when unavailable.
 
-`remote_stats.sh` relies on the local OpenSSH client for all remote connectivity. Host-specific connection settings should be configured in `~/.ssh/config` rather than embedded in the script.
+## Configuration
 
-### Benefits
+Set these variables on the **invoking machine**; validated values are safely
+transferred in the single remote collector session. CLI values override interval
+and overall timeout environment settings.
 
-* Supports SSH keys without modifying the script
-* Supports non-standard ports
-* Supports bastion/jump hosts (`ProxyJump`)
-* Supports cloud VMs and VPN-only hosts
-* Keeps monitoring logic separate from connection logic
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RS_INTERVAL` | `2` | Refresh delay in seconds. |
+| `RS_TIMEOUT` | `30` | Overall snapshot deadline in seconds. |
+| `RS_HTTP_TIMEOUT` | `5` | HTTP deadline, PostgreSQL connection timeout, and statement timeout in seconds. |
+| `RS_NETDATA_URL` | `http://localhost:19999` | Base URL as seen by the monitored host. No embedded credentials, query, or fragment. |
+| `RS_PGHOST` | `localhost` | PostgreSQL host or socket directory on the monitored host. |
+| `RS_PGPORT` | `5432` | PostgreSQL port (1–65535). |
+| `RS_PGUSER` | `remote_monitor` | PostgreSQL monitoring role. |
+| `RS_PGDATABASE` | `postgres` | PostgreSQL database. |
+| `RS_WG_INTERFACE` | `wg0` | WireGuard interface, at most 15 characters. |
+| `RS_WG_RECENT` | `600` | Positive handshake age window in seconds. |
+| `RS_CPU_WARN`, `RS_CPU_CRIT` | `20`, `70` | CPU thresholds. |
+| `RS_RAM_WARN`, `RS_RAM_CRIT` | `70`, `90` | RAM thresholds. |
+| `RS_LOAD_WARN`, `RS_LOAD_CRIT` | `100`, `200` | Normalized load thresholds. |
+| `RS_DISK_WARN`, `RS_DISK_CRIT` | `80`, `90` | Space and inode thresholds. |
+| `RS_PG_WARN`, `RS_PG_CRIT` | `80`, `90` | PostgreSQL connection thresholds. |
 
----
+Integers must use decimal notation without leading zeros. Warning thresholds
+must be lower than critical thresholds. Percentage critical thresholds cannot
+exceed 100; load thresholds may. The collector sets `LC_ALL=C` for numeric parsing.
+The overall deadline may truncate later collectors; increase it for slow hosts.
+It sends TERM and allows at most two additional seconds before KILL. SSH also
+uses a three-second connection timeout and server liveness probes.
 
-## 🔭 Future Improvements
+## PostgreSQL profile
 
-* `--no-color` flag
-* `--brief` mode (single-line output)
-* multi-host wrapper (`fleet_stats.sh`)
-* role-based metrics (e.g., `--postgres`)
-* tmux dashboard launcher
+Install `psql` and `pg_isready` on the monitored host. Have a database administrator
+create a login role with CONNECT access to the chosen database and monitoring
+visibility into other sessions (for example, the built-in `pg_monitor` role).
+Check that the role can read the required `pg_stat_activity` fields for other
+users; restricted visibility can otherwise underreport query issues.
+
+Configure authentication on that host for the SSH account, using a protected
+`.pgpass` file or the site's existing PostgreSQL authentication mechanism. The
+script uses `psql -w` and never prompts. It does not transfer passwords from the
+invoking machine or accept them as command-line options. For local collection,
+the normal libpq environment and credential files are available locally. The
+script overrides connection identity settings and `PGOPTIONS` to enforce its
+statement deadline.
+
+## WireGuard profile
+
+Install `ip`, `sudo`, WireGuard, and the [root-owned aggregate helper](helpers/README.md)
+on the monitored host. The helper returns only peer counts and handshake age.
+Upgrade the helper and main script together: the old raw-dump protocol is no
+longer supported.
+
+## Troubleshooting and validation
+
+Run `--once --debug` first. Debug output deliberately exposes only fixed failure
+reasons, not raw HTTP, database, SSH, or privileged command output, which could
+contain sensitive data. Diagnose SSH separately with `ssh target hostname`.
+Check Netdata locally on the monitored host. Validate PostgreSQL credentials with
+`psql -w` under the same SSH account. Test the helper using the installation guide.
+
+The test suite uses mocked commands and does not validate live Netdata versions,
+database permissions, SSH configuration, sudoers policy, or VPN connectivity.
+There is no metrics storage or automatic recovery. The Windows OBS watchdog
+remains a [roadmap](WATCHDOG.md).

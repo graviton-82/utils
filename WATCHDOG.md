@@ -1,3 +1,7 @@
+# OBS Watchdog Roadmap
+
+Status: planned; no watchdog implementation is included yet.
+
 ## Watchdog Utilities
 
 This repository will also include lightweight watchdog tools for recovering failed or stalled applications.

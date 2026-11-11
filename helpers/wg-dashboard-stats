@@ -1,4 +1,25 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# Root-owned helper: never print private keys, preshared keys, or raw dumps.
 set -euo pipefail
-
-/usr/bin/wg show wg0 dump
+export LC_ALL=C
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+interface="${1:-wg0}"
+threshold="${2:-600}"
+[[ $# -le 2 && "$interface" =~ ^[a-zA-Z0-9_=+.-]{1,15}$ && "$interface" != -* ]] || exit 2
+[[ "$threshold" =~ ^[1-9][0-9]{0,8}$ ]] || exit 2
+# latest-handshakes returns only public keys and timestamps. Aggregate before output.
+/usr/bin/wg show "$interface" latest-handshakes | /usr/bin/awk -v threshold="$threshold" '
+BEGIN {now=systime(); peers=0; active=0; newest=-1; invalid=0}
+{
+    if (NF != 2 || $2 !~ /^[0-9]+$/) {invalid=1; next}
+    peers++
+    if ($2 > 0) {
+        age=now-$2; if (age < 0) age=0
+        if (age <= threshold) active++
+        if (newest == -1 || age < newest) newest=age
+    }
+}
+END {
+    if (invalid) exit 1
+    printf "%d|%d|%d\n",peers,active,newest
+}'

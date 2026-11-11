@@ -1,549 +1,346 @@
 #!/usr/bin/env bash
+# Linux monitoring over a single SSH session per snapshot.
+set -uo pipefail
 
-set -u
-
-RED="\033[0;31m"
-YELLOW="\033[0;33m"
-GREEN="\033[0;32m"
-RESET="\033[0m"
-
-remote_target=""
-mode=""
-disk_mount="/"
-profile="base"
-
-if [ $# -lt 1 ]; then
-    echo "Usage: $0 <ssh-target|localhost> [--once] [mount] [--profile base|db|vpn]"
-    exit 1
-fi
-
-remote_target="$1"
-shift
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --once)
-            mode="--once"
-            ;;
-        --profile)
-            shift
-            profile="${1:-base}"
-            ;;
-        *)
-            disk_mount="$1"
-            ;;
-    esac
-    shift
-done
-
-##### Localhost + Remote Helpers #####
-
-is_local_target() {
-    local target="$1"
-    local local_host
-
-    local_host="$(hostname)"
-
-    [[ "$target" == "localhost" || \
-       "$target" == "127.0.0.1" || \
-       "$target" == "$local_host" ]]
+usage() {
+    cat <<'EOF'
+Usage: remote_stats.sh <ssh-target|localhost> [--once] [mount] [options]
+  --profile base|db|vpn   Additional service metrics (default: base)
+  --interval SECONDS     Refresh delay (default: 2)
+  --timeout SECONDS      Overall snapshot deadline (default: 30)
+  --no-color            Disable ANSI colors (also honors NO_COLOR)
+  --json                JSON snapshot; implies --once
+  --debug               Print sanitized collection failure reasons to stderr
+  --help                Show this help
+Configuration: see REMOTESTATS.md for RS_* environment variables.
+Exit codes: 0 complete snapshot (including unhealthy services),
+            1 incomplete collection, 2 invalid arguments/configuration.
+EOF
 }
-
-run_remote() {
-    local cmd="$1"
-
-    if is_local_target "$remote_target"; then
-        bash -lc "$cmd" 2>/dev/null
-    else
-        ssh -n -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" "$cmd"
-    fi
-}
-
-run_remote_bash() {
-    if is_local_target "$remote_target"; then
-        bash -s
-    else
-        ssh -o BatchMode=yes -o ConnectTimeout=3 "$remote_target" 'bash -s'
-    fi
-}
-
-##### Formatting / Status Helpers #####
-
-color_status() {
-    local status="$1"
-
-    case "$status" in
-        OK)
-            printf "${GREEN}%s${RESET}" "$status"
-            ;;
-        HEALTHY)
-            printf "${GREEN}%s${RESET}" "$status"
-            ;;
-        WARNING)
-            printf "${YELLOW}%s${RESET}" "$status"
-            ;;
-        CRITICAL)
-            printf "${RED}%s${RESET}" "$status"
-            ;;
-        OFFLINE)
-            printf "${RED}%s${RESET}" "$status"
-            ;;
-        UNKNOWN)
-            printf "${YELLOW}%s${RESET}" "$status"
-            ;;
-        *)
-            printf "%s" "$status"
-            ;;
-    esac
-}
-
-status_from_thresholds() {
-    local value="$1"
-    local warn="$2"
-    local crit="$3"
-
-    awk -v v="$value" -v w="$warn" -v c="$crit" 'BEGIN {
-        if (v >= c) print "CRITICAL";
-        else if (v >= w) print "WARNING";
-        else print "OK";
+fail() { printf 'remote_stats: %s\n' "$*" >&2; return 2; }
+uint() { [[ "$1" =~ ^(0|[1-9][0-9]{0,8})$ ]]; }
+positive() { uint "$1" && (( $1 > 0 )); }
+threshold_status() {
+    awk -v v="$1" -v w="$2" -v c="$3" 'BEGIN {
+        print (v >= c ? "CRITICAL" : v >= w ? "WARNING" : "OK")
     }'
 }
 
-status_from_inode_usage() {
-    local value="$1"
-
-    awk -v v="$value" 'BEGIN {
-        if (v >= 90) print "CRITICAL";
-        else if (v >= 80) print "WARNING";
-        else print "OK";
-    }'
+# Collector functions execute on the monitored host. Records contain no secrets.
+metric_error() { printf '%s|UNKNOWN|%s\n' "$1" "$2"; }
+netdata_metric() {
+    local metric="$1" chart="$2" body value
+    if ! body=$(curl -fsS --connect-timeout "$http_timeout" --max-time "$http_timeout" \
+        "${netdata_url%/}/api/v1/data?chart=$chart"); then
+        metric_error "$metric" http_failed; return
+    fi
+    if ! value=$(printf '%s' "$body" | jq -er --arg kind "$metric" '
+        .labels as $labels |
+        if (.data | type) != "array" or (.data | length) == 0 then error("no samples") else . end |
+        ($labels | index("time")) as $ti |
+        if $ti == null then error("no timestamp") else . end |
+        if any(.data[]; (.[ $ti ] | type) != "number") then error("bad timestamp") else . end |
+        (.data | max_by(.[$ti])) as $sample |
+        (if $kind == "CPU" then ["user", "system", "iowait"]
+         else ["used", "free", "cached", "buffers"] end) as $names |
+        [$names[] | . as $name | ($labels | index($name)) as $i |
+            if $i == null then error("missing dimension") else $sample[$i] end] as $v |
+        if any($v[]; type != "number" or . < 0) then error("invalid dimension") else . end |
+        if $kind == "CPU" then $v + [($v | add)]
+        elif ($v | add) > 0 then [($v[0] / ($v | add) * 100), ($v | add)]
+        else error("invalid RAM total") end | map(tostring) | join("|")'); then
+        metric_error "$metric" invalid_sample; return
+    fi
+    printf '%s|VALUE|%s\n' "$metric" "$value"
 }
-
-status_from_pg_connections() {
-    local value="$1"
-
-    awk -v v="$value" 'BEGIN {
-        if (v >= 90) print "CRITICAL";
-        else if (v >= 70) print "WARNING";
-        else print "OK";
-    }'
-}
-
-status_from_pg_metrics() {
-    local used_pct="$1"
-    local idle_tx="$2"
-    local long_q="$3"
-    local blocked="$4"
-
-    if (( blocked > 0 )); then
-        echo "CRITICAL"
-    elif (( used_pct >= 90 )); then
-        echo "CRITICAL"
-    elif (( idle_tx > 0 || long_q > 0 )); then
-        echo "WARNING"
-    elif (( used_pct >= 80 )); then
-        echo "WARNING"
+collect_disk() {
+    local metric="$1" flag="$2" value
+    if ! value=$(df "$flag" -- "$disk_mount" | awk 'NR==2 {
+        gsub(/%/, "", $5); if ($5 ~ /^[0-9]+$/) print $5
+    }') || [[ -z "$value" ]]; then
+        metric_error "$metric" df_failed
     else
-        echo "OK"
+        printf '%s|VALUE|%s\n' "$metric" "$value"
     fi
 }
-
-status_from_vpn() {
-    local newest="$1"
-
-    if [[ ! "$newest" =~ ^[0-9]+$ ]]; then
-        echo "WARNING"
-    elif (( newest <= 600 )); then
-        echo "HEALTHY"
+collect_pg() {
+    local value
+    if ! command -v psql >/dev/null || ! command -v pg_isready >/dev/null; then
+        metric_error PG client_missing; return
+    fi
+    export PGHOST="$pg_host" PGPORT="$pg_port" PGUSER="$pg_user" PGDATABASE="$pg_database"
+    export PGCONNECT_TIMEOUT="$http_timeout" PGOPTIONS="-c statement_timeout=${http_timeout}000"
+    if ! pg_isready -q -t "$http_timeout"; then
+        printf 'PG|CRITICAL|not_accepting_connections\n'; return
+    fi
+    if ! value=$(psql -w -X -A -t -q -v ON_ERROR_STOP=1 -c "
+SELECT count(*) || '|' || current_setting('max_connections')
+ || '|' || count(*) FILTER (WHERE state = 'active')
+ || '|' || count(*) FILTER (WHERE state = 'idle')
+ || '|' || count(*) FILTER (WHERE state = 'idle in transaction'
+      AND now() - xact_start > interval '60 seconds')
+ || '|' || count(*) FILTER (WHERE state = 'active'
+      AND now() - query_start > interval '60 seconds')
+ || '|' || count(*) FILTER (WHERE wait_event_type = 'Lock')
+FROM pg_stat_activity WHERE backend_type = 'client backend' AND pid <> pg_backend_pid();"); then
+        metric_error PG query_failed; return
+    fi
+    if [[ "$value" =~ ^[0-9]+\|[1-9][0-9]*\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+$ ]]; then
+        printf 'PG|VALUE|%s\n' "$value"
     else
-        echo "WARNING"
+        metric_error PG invalid_response
     fi
 }
-
-##### Basic Functions #####
-
-get_uptime() {
-    run_remote_bash <<'EOF' 2>/dev/null
-read -r uptime_seconds _ < /proc/uptime || exit 1
-
-awk -v s="$uptime_seconds" 'BEGIN {
-  s = int(s)
-  d = int(s / 86400)
-  h = int((s % 86400) / 3600)
-  m = int((s % 3600) / 60)
-
-  if (d > 0) {
-    printf "%dd%dh\n", d, h
-  } else if (h > 0) {
-    printf "%dh%dm\n", h, m
-  } else {
-    printf "%dm\n", m
-  }
-}'
-EOF
-}
-
-get_inodes() {
-    run_remote_bash <<EOF 2>/dev/null
-df -Pi "$disk_mount" | awk 'NR==2 {
-  gsub(/%/, "", \$5)
-  printf "%s|%s\n", \$5, \$6
-}'
-EOF
-}
-
-get_cpu() {
-    run_remote_bash <<'EOF' 2>/dev/null
-curl -fsS "http://localhost:19999/api/v1/data?chart=system.cpu" | jq -r '
-  .labels as $l |
-  .data[-1] as $d |
-  ($d[($l|index("user"))] // 0) as $user |
-  ($d[($l|index("system"))] // 0) as $system |
-  ($d[($l|index("iowait"))] // 0) as $iowait |
-  ($user + $system + $iowait) as $total |
-  "\($user)|\($system)|\($iowait)|\($total)"
-'
-EOF
-}
-
-get_ram() {
-    run_remote_bash <<'EOF' 2>/dev/null
-curl -fsS "http://localhost:19999/api/v1/data?chart=system.ram" | jq -r '
-  .labels as $l |
-  .data[-1] as $d |
-  ($d[($l|index("used"))] // 0) as $used |
-  ($d[($l|index("free"))] // 0) as $free |
-  ($d[($l|index("cached"))] // 0) as $cached |
-  ($d[($l|index("buffers"))] // 0) as $buffers |
-  ($used + $free + $cached + $buffers) as $total_mb |
-  (if $total_mb > 0 then (($used / $total_mb) * 100) else 0 end) as $used_pct |
-  "\($used_pct)|\($total_mb)"
-'
-EOF
-}
-
-get_load() {
-    run_remote_bash <<'EOF' 2>/dev/null
-read -r loadavg _ < /proc/loadavg || exit 1
-
-cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || cpus=""
-if [ -z "$cpus" ]; then
-    cpus=$(nproc 2>/dev/null) || cpus=""
-fi
-if [ -z "$cpus" ]; then
-    cpus=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null) || cpus=""
-fi
-if [ -z "$cpus" ] || [ "$cpus" -le 0 ] 2>/dev/null; then
-    cpus=1
-fi
-
-awk -v loadavg="$loadavg" -v cpus="$cpus" 'BEGIN {
-  norm = (cpus > 0) ? (loadavg / cpus) * 100 : 0
-  printf "%.2f|%d|%.0f\n", loadavg, cpus, norm
-}'
-EOF
-}
-
-get_disk() {
-    run_remote_bash <<EOF 2>/dev/null
-df -P "$disk_mount" | awk 'NR==2 {
-  gsub(/%/, "", \$5)
-  printf "%s|%s|%s|%s|%s\n", \$5, \$6, \$2, \$3, \$4
-}'
-EOF
-}
-
-##### Database Profile Functions #####
-
-get_postgres() {
-    run_remote_bash <<'EOF' 2>/dev/null
-PGDATABASE=postgres
-PGUSER=remote_monitor
-PGHOST=localhost
-PGPORT=5432
-
-if ! command -v pg_isready >/dev/null 2>&1; then
-    echo "UNKNOWN|pg_isready_missing"
-    exit 0
-fi
-
-if ! command -v psql >/dev/null 2>&1; then
-    echo "UNKNOWN|psql_missing"
-    exit 0
-fi
-
-if ! pg_isready -q -h "$PGHOST" -p "$PGPORT" -d "$PGDATABASE" -U "$PGUSER"; then
-    echo "DOWN"
-    exit 0
-fi
-
-psql -X -A -t -q \
-    -h "$PGHOST" \
-    -p "$PGPORT" \
-    -U "$PGUSER" \
-    -d "$PGDATABASE" \
-    -c "
-SELECT
-  'UP'
-  || '|total='   || count(*)
-  || '|max='     || current_setting('max_connections')
-  || '|active='  || count(*) FILTER (WHERE state = 'active')
-  || '|idle='    || count(*) FILTER (WHERE state = 'idle')
-  || '|idle_tx=' || count(*) FILTER (
-       WHERE state = 'idle in transaction'
-         AND xact_start IS NOT NULL
-         AND now() - xact_start > interval '60 seconds'
-     )
-  || '|long_q='  || count(*) FILTER (
-       WHERE state = 'active'
-         AND query_start IS NOT NULL
-         AND now() - query_start > interval '60 seconds'
-     )
-  || '|blocked=' || count(*) FILTER (
-       WHERE wait_event_type = 'Lock'
-     )
-FROM pg_stat_activity
-WHERE pid <> pg_backend_pid();
-" 2>/dev/null || echo "UNKNOWN|query_failed"
-EOF
-}
-
-##### VPN Profile Functions #####
-
-##### VPN Profile Functions #####
-
-get_vpn() {
-    run_remote_bash <<'EOF' 2>/dev/null
-WG_IF="wg0"
-RECENT_THRESHOLD=600
-
-if ! command -v sudo >/dev/null 2>&1; then
-    echo "UNKNOWN|sudo_missing"
-    exit 0
-fi
-
-if ! command -v ip >/dev/null 2>&1; then
-    echo "UNKNOWN|ip_missing"
-    exit 0
-fi
-
-if ! ip link show "$WG_IF" >/dev/null 2>&1; then
-    echo "DOWN|interface_missing"
-    exit 0
-fi
-
-if ! dump=$(sudo -n /usr/local/bin/wg-dashboard-stats 2>/dev/null); then
-    echo "CRITICAL|sudo access to wg-dashboard-stats unavailable"
-    exit 0
-fi
-
-read -r peer_count active_count newest_age < <(
-    printf '%s\n' "$dump" |
-    awk -v threshold="$RECENT_THRESHOLD" '
-    BEGIN {
-        now = systime()
-        peers = 0
-        active = 0
-        newest = -1
-    }
-
-    # Skip interface line. Peer lines have:
-    # public-key preshared-key endpoint allowed-ips latest-handshake rx tx keepalive
-    NR > 1 && NF >= 8 {
-        peers++
-
-        handshake = $5
-
-        if (handshake > 0) {
-            age = now - handshake
-
-            # Protect against small clock mismatch
-            if (age < 0) age = 0
-
-            if (age <= threshold) active++
-
-            if (newest == -1 || age < newest) {
-                newest = age
-            }
-        }
-    }
-
-    END {
-        if (newest == -1) newest = 999999
-        print peers, active, newest
-    }'
-)
-
-echo "${peer_count}|${active_count}|${newest_age}|${WG_IF}"
-
-EOF
-}
-
-##### Main Script Logic and Formatting #####
-
-if [[ "$mode" == "--once" ]]; then
-    if ! remote_host=$(run_remote 'hostname' 2>/dev/null); then
-        remote_host="$remote_target"
+collect_vpn() {
+    local value peers active newest
+    if ! command -v ip >/dev/null || ! command -v sudo >/dev/null; then
+        metric_error VPN client_missing; return
     fi
-
-    cpu_line=$(get_cpu || true)
-    ram_line=$(get_ram || true)
-    load_line=$(get_load || true)
-    disk_line=$(get_disk || true)
-    uptime_line=$(get_uptime || true)
-    inode_line=$(get_inodes || true)
-
-    if [[ -z "$cpu_line" && -z "$ram_line" && -z "$load_line" && -z "$disk_line" ]]; then
-        echo "=== ${remote_host} (${remote_target}) ==="
-        offline_colored=$(color_status "OFFLINE")
-        printf "HOST : %b\n" "$offline_colored"
-        exit 0
+    if ! ip link show dev "$wg_interface" >/dev/null; then
+        printf 'VPN|CRITICAL|interface_missing\n'; return
     fi
-
-    if [[ -n "$uptime_line" ]]; then
-        echo "=== ${remote_host} (${remote_target}) | UP ${uptime_line} ==="
+    if ! value=$(sudo -n /usr/local/bin/wg-dashboard-stats "$wg_interface" "$wg_recent"); then
+        printf 'VPN|CRITICAL|helper_unavailable\n'; return
+    fi
+    if [[ ! "$value" =~ ^(0|[1-9][0-9]{0,8})\|(0|[1-9][0-9]{0,8})\|(-1|0|[1-9][0-9]{0,11})$ ]]; then
+        metric_error VPN invalid_response; return
+    fi
+    IFS='|' read -r peers active newest <<< "$value"
+    if (( active > peers || (peers == 0 && newest != -1) || (newest == -1 && active != 0) )); then
+        metric_error VPN invalid_response; return
+    fi
+    printf 'VPN|VALUE|%s\n' "$value"
+}
+collect_snapshot() {
+    local load cpus seconds
+    printf 'HOST|OK|%s\n' "$(hostname)"
+    if read -r seconds _ < /proc/uptime; then
+        awk -v s="$seconds" 'BEGIN {printf "UP|VALUE|%dd%dh%dm\n", s/86400, (s%86400)/3600, (s%3600)/60}'
     else
-        echo "=== ${remote_host} (${remote_target}) ==="
+        metric_error UP unavailable
     fi
-
-    if [[ -n "$cpu_line" ]]; then
-        IFS='|' read -r cpu_user cpu_system cpu_iowait cpu_total <<< "$cpu_line"
-        cpu_status=$(status_from_thresholds "$cpu_total" 20 70)
-        cpu_status_colored=$(color_status "$cpu_status")
-
-        printf "CPU  : %-9b user=%.1f%% system=%.1f%% iowait=%.1f%% total=%.1f%%\n" \
-            "$cpu_status_colored" "$cpu_user" "$cpu_system" "$cpu_iowait" "$cpu_total"
+    netdata_metric CPU system.cpu
+    netdata_metric RAM system.ram
+    if read -r load _ < /proc/loadavg && cpus=$(getconf _NPROCESSORS_ONLN) && positive "$cpus"; then
+        awk -v l="$load" -v c="$cpus" 'BEGIN {printf "LOAD|VALUE|%.2f|%d|%.0f\n", l,c,l/c*100}'
     else
-        echo "CPU  : UNKNOWN   unavailable"
+        metric_error LOAD unavailable
     fi
+    collect_disk DISK -P
+    collect_disk INOD -Pi
+    case "$profile" in db) collect_pg ;; vpn) collect_vpn ;; esac
+}
 
-    if [[ -n "$ram_line" ]]; then
-        IFS='|' read -r ram_used_pct ram_total_mb <<< "$ram_line"
-        ram_total_gib=$(awk -v t="$ram_total_mb" 'BEGIN { printf "%.2f", t/1024 }')
-        ram_status=$(status_from_thresholds "$ram_used_pct" 70 90)
-        ram_status_colored=$(color_status "$ram_status")
+# printf %q creates Bash source, consumed by bash -s rather than the SSH login shell.
+# Arguments are never interpolated into the SSH command string.
+collector_source() {
+    local name
+    printf 'set -uo pipefail\nexport LC_ALL=C\n'
+    for name in disk_mount profile http_timeout netdata_url pg_host pg_port pg_user pg_database wg_interface wg_recent; do
+        printf '%s=%q\n' "$name" "${!name}"
+    done
+    declare -f uint positive metric_error netdata_metric collect_disk collect_pg collect_vpn collect_snapshot
+    printf '\ncollect_snapshot\n'
+}
 
-        printf "RAM  : %-9b used=%.0f%% total=%s GiB\n" \
-            "$ram_status_colored" "$ram_used_pct" "$ram_total_gib"
-    else
-        echo "RAM  : UNKNOWN   unavailable"
+add_record() {
+    local name="$1" status="$2" detail="$3"
+    names+=("$name"); statuses+=("$status"); details+=("$detail")
+    [[ "$status" != UNKNOWN && "$status" != OFFLINE ]] || incomplete=1
+    if (( debug )) && [[ "$status" == UNKNOWN || "$status" == OFFLINE || "$detail" == helper_unavailable ]]; then
+        printf 'remote_stats: %s: %s\n' "$name" "$detail" >&2
     fi
-
-    if [[ -n "$load_line" ]]; then
-        IFS='|' read -r load1 cpus load_norm <<< "$load_line"
-	load_status=$(status_from_thresholds "$load_norm" 100 200)
-        load_status_colored=$(color_status "$load_status")
-
-        printf "LOAD : %-9b load1=%s cpus=%s normalized=%s%%\n" \
-            "$load_status_colored" "$load1" "$cpus" "$load_norm"
-    else
-        echo "LOAD : UNKNOWN   unavailable"
-    fi
-
-    if [[ -n "$disk_line" ]]; then
-        IFS='|' read -r disk_used_pct disk_mount_out disk_size_k disk_used_k disk_avail_k <<< "$disk_line"
-        disk_status=$(status_from_thresholds "$disk_used_pct" 80 90)
-        disk_status_colored=$(color_status "$disk_status")
-
-        printf "DISK : %-9b used=%s%% mount=%s\n" \
-            "$disk_status_colored" "$disk_used_pct" "$disk_mount_out"
-    else
-        echo "DISK : UNKNOWN   unavailable"
-    fi
-
-    if [[ -n "$inode_line" ]]; then
-        IFS='|' read -r inode_used_pct inode_mount_out <<< "$inode_line"
-        inode_status=$(status_from_inode_usage "$inode_used_pct")
-        inode_status_colored=$(color_status "$inode_status")
-
-        printf "INOD : %-9b used=%s%% mount=%s\n" \
-            "$inode_status_colored" "$inode_used_pct" "$inode_mount_out"
-    else
-        echo "INOD : UNKNOWN   unavailable"
-    fi
-
-    if [[ "$profile" == "db" ]]; then
-        pg_line=$(get_postgres || true)
-
-        if [[ -z "$pg_line" ]]; then
-            echo "PG   : UNKNOWN   unavailable"
-        elif [[ "$pg_line" == "DOWN" ]]; then
-            pg_status_colored=$(color_status "CRITICAL")
-            printf "PG   : %-9b down\n" "$pg_status_colored"
-        elif [[ "$pg_line" == UNKNOWN\|* ]]; then
-            pg_reason="${pg_line#UNKNOWN|}"
-            printf "PG   : %-9s %s\n" "UNKNOWN" "$pg_reason"
-        elif [[ "$pg_line" == UP\|* ]]; then
-            IFS='|' read -r pg_state \
-                pg_total_field \
-                pg_max_field \
-                pg_active_field \
-                pg_idle_field \
-                pg_idle_tx_field \
-                pg_long_q_field \
-                pg_blocked_field <<< "$pg_line"
-
-            pg_total="${pg_total_field#total=}"
-            pg_max="${pg_max_field#max=}"
-            pg_active="${pg_active_field#active=}"
-            pg_idle="${pg_idle_field#idle=}"
-            pg_idle_tx="${pg_idle_tx_field#idle_tx=}"
-            pg_long_q="${pg_long_q_field#long_q=}"
-            pg_blocked="${pg_blocked_field#blocked=}"
-
-            pg_used_pct=$(awk -v c="$pg_total" -v m="$pg_max" 'BEGIN {
-                if (m > 0) printf "%.0f", (c/m)*100;
-                else print 0
-            }')
-
-            pg_status=$(status_from_pg_metrics "$pg_used_pct" "$pg_idle_tx" "$pg_long_q" "$pg_blocked")
-            pg_status_colored=$(color_status "$pg_status")
-
-            printf "PG   : %-9b conns=%s/%s used=%s%% active=%s idle=%s idle_tx=%s long_q=%s blocked=%s\n" \
-                "$pg_status_colored" \
-                "$pg_total" "$pg_max" "$pg_used_pct" \
-                "$pg_active" "$pg_idle" "$pg_idle_tx" "$pg_long_q" "$pg_blocked"
-        else
-            printf "PG   : %-9s %s\n" "UNKNOWN" "unexpected_output"
+}
+parse_snapshot() {
+    local data="$1" name state value a b c d e f g status detail
+    local numeric='[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?'
+    local -A seen=()
+    names=(); statuses=(); details=(); incomplete=0; remote_host="$target"; uptime_text=""
+    while IFS='|' read -r name state value; do
+        case "$name" in HOST|UP|CPU|RAM|LOAD|DISK|INOD|PG|VPN) ;; *) continue ;; esac
+        [[ ! ${seen[$name]+exists} ]] || continue
+        seen[$name]=1
+        if [[ "$name" == HOST && "$state" == OK && -n "$value" ]]; then
+            remote_host="$value"; continue
         fi
-    fi
-
-    if [[ "$profile" == "vpn" ]]; then
-        vpn_line=$(get_vpn || true) 
-
-        if [[ -z "$vpn_line" ]]; then 
-          vpn_status_colored=$(color_status "UNKNOWN") 
-          printf "VPN  : %-9b unavailable\n" "$vpn_status_colored"
-
-        elif [[ "$vpn_line" == UNKNOWN\|* ]]; then 
-          vpn_reason="${vpn_line#UNKNOWN|}"
-          vpn_status_colored=$(color_status "UNKNOWN")
-          printf "VPN  : %-9b %s\n" "$vpn_status_colored" "$vpn_reason" 
-
-        elif [[ "$vpn_line" == DOWN\|* ]]; then
-          vpn_reason="${vpn_line#DOWN|}"
-          vpn_status_colored=$(color_status "CRITICAL") 
-          printf "VPN  : %-9b %s\n" "$vpn_status_colored" "$vpn_reason" 
-
-        else 
-          IFS='|' read -r vpn_total vpn_active vpn_newest vpn_if <<< "$vpn_line" 
-          vpn_status=$(status_from_vpn "$vpn_newest") 
-          vpn_status_colored=$(color_status "$vpn_status")
-
-          printf "VPN  : %-9b iface=%s active=%s/%s newest=%ss\n" \
-            "$vpn_status_colored" \
-            "$vpn_if" \
-            "$vpn_active" \
-            "$vpn_total" \
-            "$vpn_newest"
+        if [[ "$name" == UP && "$state" == VALUE && "$value" =~ ^[0-9]+d[0-9]+h[0-9]+m$ ]]; then
+            uptime_text="$value"; continue
         fi
+        if [[ "$state" == UNKNOWN || "$state" == CRITICAL ]]; then
+            # Only known reason tokens are displayed; collector stderr and raw responses may contain secrets.
+            case "$value" in
+                http_failed|invalid_sample|df_failed|client_missing|query_failed|invalid_response|unavailable|not_accepting_connections|interface_missing|helper_unavailable) ;;
+                *) value=invalid_response; state=UNKNOWN ;;
+            esac
+            add_record "$name" "$state" "$value"
+            [[ "$value" != helper_unavailable ]] || incomplete=1
+            continue
+        fi
+        status=UNKNOWN; detail=invalid_response
+        if [[ "$state" == VALUE ]]; then
+            IFS='|' read -r a b c d e f g <<< "$value"
+            case "$name" in
+                CPU)
+                    if [[ "$value" =~ ^$numeric\|$numeric\|$numeric\|$numeric$ ]]; then
+                        status=$(threshold_status "$d" "$cpu_warn" "$cpu_crit")
+                        printf -v detail 'user=%.1f%% system=%.1f%% iowait=%.1f%% total=%.1f%%' "$a" "$b" "$c" "$d"
+                    fi ;;
+                RAM)
+                    if [[ "$value" =~ ^$numeric\|$numeric$ ]]; then
+                        status=$(threshold_status "$a" "$ram_warn" "$ram_crit")
+                        detail=$(awk -v p="$a" -v m="$b" 'BEGIN {printf "used=%.0f%% total=%.2f GiB",p,m/1024}')
+                    fi ;;
+                LOAD)
+                    if [[ "$value" =~ ^[0-9]+([.][0-9]+)?\|[1-9][0-9]*\|[0-9]+$ ]]; then
+                        status=$(threshold_status "$c" "$load_warn" "$load_crit")
+                        detail="load1=$a cpus=$b normalized=$c%"
+                    fi ;;
+                DISK|INOD)
+                    if uint "$value" && (( value <= 100 )); then
+                        status=$(threshold_status "$value" "$disk_warn" "$disk_crit")
+                        detail="used=$value% mount=$disk_mount"
+                    fi ;;
+                PG)
+                    if [[ "$value" =~ ^[0-9]+\|[1-9][0-9]*\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+$ ]]; then
+                        local pct
+                        pct=$(awk -v n="$a" -v m="$b" 'BEGIN {printf "%.0f",n/m*100}')
+                        status=$(threshold_status "$pct" "$pg_warn" "$pg_crit")
+                        if (( g > 0 )); then status=CRITICAL
+                        elif [[ "$status" == OK ]] && (( e > 0 || f > 0 )); then status=WARNING; fi
+                        detail="conns=$a/$b used=$pct% active=$c idle=$d idle_tx=$e long_q=$f blocked=$g"
+                    fi ;;
+                VPN)
+                    if [[ "$value" =~ ^(0|[1-9][0-9]{0,8})\|(0|[1-9][0-9]{0,8})\|(-1|0|[1-9][0-9]{0,11})$ ]] && (( b <= a && (a > 0 || c == -1) && (c != -1 || b == 0) )); then
+                        status=OK
+                        if (( c == -1 || c > wg_recent )); then
+                            detail="iface=$wg_interface active=$b/$a newest=${c}s idle_or_no_handshake"
+                        else
+                            detail="iface=$wg_interface active=$b/$a newest=${c}s"
+                        fi
+                    fi ;;
+            esac
+        fi
+        add_record "$name" "$status" "$detail"
+    done <<< "$data"
+    if [[ ! ${seen[HOST]+exists} || "$data" != HOST\|OK\|* ]]; then
+        names=(); statuses=(); details=()
+        add_record HOST OFFLINE connection_or_deadline_failed
+        return
     fi
+    for name in UP CPU RAM LOAD DISK INOD; do
+        [[ ${seen[$name]+exists} ]] || add_record "$name" UNKNOWN missing_record
+    done
+    case "$profile" in
+        db) [[ ${seen[PG]+exists} ]] || add_record PG UNKNOWN missing_record ;;
+        vpn) [[ ${seen[VPN]+exists} ]] || add_record VPN UNKNOWN missing_record ;;
+    esac
+}
+render_snapshot() {
+    local i status color
+    if (( json )); then
+        {
+            printf '%s\0%s\0%s\0' "$target" "$remote_host" "$uptime_text"
+            for i in "${!names[@]}"; do printf '%s\0%s\0%s\0' "${names[$i]}" "${statuses[$i]}" "${details[$i]}"; done
+        } | jq -Rs 'split("\u0000") | .[:-1] |
+            {target:.[0],host:.[1],uptime:.[2],metrics:(.[3:] | [range(0;length;3) as $i |
+            {name:.[$i],status:.[$i+1],detail:.[$i+2]}])}'
+        return
+    fi
+    printf '=== %s (%s)' "$remote_host" "$target"
+    [[ -z "$uptime_text" ]] || printf ' | UP %s' "$uptime_text"
+    printf ' ===\n'
+    for i in "${!names[@]}"; do
+        status="${statuses[$i]}"; color=""
+        if (( use_color )); then
+            case "$status" in OK) color=$'\033[32m' ;; WARNING|UNKNOWN) color=$'\033[33m' ;; *) color=$'\033[31m' ;; esac
+        fi
+        printf '%-5s: %s%-9s' "${names[$i]}" "$color" "$status"
+        (( ! use_color )) || printf '\033[0m'
+        printf ' %s\n' "${details[$i]}"
+    done
+}
+snapshot() {
+    local data rc=0
+    if [[ "$target" == localhost || "$target" == 127.0.0.1 || "$target" == "$(hostname)" ]]; then
+        data=$(collector_source | timeout --signal=TERM --kill-after=2 "$deadline" bash -s 2>/dev/null) || rc=$?
+    else
+        data=$(collector_source | timeout --signal=TERM --kill-after=2 "$deadline" \
+            ssh -T -o BatchMode=yes -o ConnectTimeout=3 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+            "$target" 'bash -s' 2>/dev/null) || rc=$?
+    fi
+    parse_snapshot "$data"
+    if (( rc != 0 )); then
+        incomplete=1
+        if [[ "$data" == HOST\|OK\|* ]]; then add_record COLLECTION UNKNOWN deadline_or_transport_failed; fi
+        (( ! debug )) || printf 'remote_stats: transport/collector exit=%s\n' "$rc" >&2
+    fi
+    render_snapshot || return 1
+    (( incomplete == 0 ))
+}
+main() {
+    export LC_ALL=C
+    local target="" profile=base disk_mount=/ mount_set=0 once=0 json=0 debug=0 use_color=0
+    local interval="${RS_INTERVAL:-2}" deadline="${RS_TIMEOUT:-30}" http_timeout="${RS_HTTP_TIMEOUT:-5}"
+    local netdata_url="${RS_NETDATA_URL:-http://localhost:19999}"
+    local pg_host="${RS_PGHOST:-localhost}" pg_port="${RS_PGPORT:-5432}"
+    local pg_user="${RS_PGUSER:-remote_monitor}" pg_database="${RS_PGDATABASE:-postgres}"
+    local wg_interface="${RS_WG_INTERFACE:-wg0}" wg_recent="${RS_WG_RECENT:-600}"
+    local cpu_warn="${RS_CPU_WARN:-20}" cpu_crit="${RS_CPU_CRIT:-70}"
+    local ram_warn="${RS_RAM_WARN:-70}" ram_crit="${RS_RAM_CRIT:-90}"
+    local load_warn="${RS_LOAD_WARN:-100}" load_crit="${RS_LOAD_CRIT:-200}"
+    local disk_warn="${RS_DISK_WARN:-80}" disk_crit="${RS_DISK_CRIT:-90}"
+    local pg_warn="${RS_PG_WARN:-80}" pg_crit="${RS_PG_CRIT:-90}"
+    local name warn crit result=0 remote_host uptime_text incomplete
+    local -a names=() statuses=() details=()
+    [[ ! -t 1 || ${NO_COLOR+x} ]] || use_color=1
+    while (( $# )); do
+        case "$1" in
+            --help|-h) usage; return 0 ;;
+            --once) once=1 ;;
+            --no-color) use_color=0 ;;
+            --json) json=1; once=1; use_color=0 ;;
+            --debug) debug=1 ;;
+            --profile|--interval|--timeout)
+                if (( $# < 2 )) || [[ -z "$2" || "$2" == --* ]]; then
+                    fail "missing value for $1"; return 2
+                fi
+                case "$1" in --profile) profile="$2" ;; --interval) interval="$2" ;; --timeout) deadline="$2" ;; esac
+                shift ;;
+            -*) fail "unknown option: $1"; return 2 ;;
+            *)
+                if [[ -z "$target" ]]; then target="$1"
+                elif (( ! mount_set )); then disk_mount="$1"; mount_set=1
+                else fail 'too many positional arguments'; return 2; fi ;;
+        esac
+        shift
+    done
+    [[ -n "$target" ]] || { usage >&2; return 2; }
+    [[ "$target" =~ ^[a-zA-Z0-9_@.:][a-zA-Z0-9_@.:%+-]*$ ]] || { fail 'invalid SSH target'; return 2; }
+    [[ "$profile" == base || "$profile" == db || "$profile" == vpn ]] || { fail 'invalid profile'; return 2; }
+    [[ "$disk_mount" != *$'\n'* && "$disk_mount" != *$'\r'* && "$disk_mount" != *'|'* ]] || { fail 'mount contains unsupported delimiter'; return 2; }
+    for name in interval deadline http_timeout wg_recent pg_port; do
+        positive "${!name}" || { fail "invalid $name"; return 2; }
+    done
+    (( pg_port <= 65535 )) || { fail 'invalid PostgreSQL port'; return 2; }
+    [[ "$wg_interface" =~ ^[a-zA-Z0-9_=+.-]{1,15}$ && "$wg_interface" != -* ]] || { fail 'invalid WireGuard interface'; return 2; }
+    [[ "$netdata_url" =~ ^https?://[^[:space:]]+$ && "$netdata_url" != *'@'* && "$netdata_url" != *'?'* && "$netdata_url" != *'#'* ]] || { fail 'invalid Netdata base URL (no credentials/query/fragment)'; return 2; }
+    for name in cpu ram load disk pg; do
+        warn="${name}_warn"; crit="${name}_crit"
+        if ! uint "${!warn}" || ! positive "${!crit}" || (( ${!warn} >= ${!crit} )); then
+            fail "invalid $name thresholds"; return 2
+        fi
+        [[ "$name" == load ]] || (( ${!crit} <= 100 )) || { fail "$name threshold exceeds 100"; return 2; }
+    done
+    command -v timeout >/dev/null || { fail 'local GNU timeout is required'; return 2; }
+    if (( json )); then command -v jq >/dev/null || { fail 'local jq is required for --json'; return 2; }; fi
+    if (( once )); then snapshot; return $?; fi
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    while :; do
+        if [[ -t 1 ]]; then printf '\033[H\033[2J'; fi
+        snapshot || result=$?
+        sleep "$interval" || return "$result"
+    done
+}
 
-    exit 0
-fi
-
-##### Script Execution #####
-
-if [[ "$mode" != "--once" ]]; then
-    watch -n 2 -t -- "$0 $remote_target --once \"$disk_mount\" --profile \"$profile\""
-fi
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
